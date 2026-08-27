@@ -97,6 +97,7 @@ def map_wiz_record_to_finding(raw_record: dict[str, Any]) -> Finding:
 
     The raw_record itself is never modified.
     """
+    score = raw_record.get("score")
 
     # Constructs a new Finding object by extracting and transforming data from the raw_record according to the defined mappings.
     return Finding(
@@ -119,8 +120,8 @@ def map_wiz_record_to_finding(raw_record: dict[str, Any]) -> Finding:
         # It handles cases where 'score' might be None, otherwise converts it to a float. score is confirmed as the CVSS base score in the supplied sample.
         cvss_base=(
             None
-            if raw_record["score"] is None
-            else float(raw_record["score"])
+            if score is None
+            else float(score)
         ),
         
         # The 'description' field is directly retrieved using .get() which gracefully handles its absence by returning None.

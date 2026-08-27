@@ -169,6 +169,53 @@ def test_invalid_wiz_score_is_rejected() -> None:
     with pytest.raises((TypeError, ValueError)):
         map_wiz_record_to_finding(invalid_record)
 
+def test_missing_wiz_score_does_not_stop_ingestion(
+    tmp_path: Path,
+) -> None:
+    """
+    A missing optional Wiz score must not terminate ingestion.
+
+    The record should still be mapped successfully with cvss_base=None.
+    """
+
+    import openpyxl
+
+    file_path = tmp_path / "missing_score_wiz.xlsx"
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+
+    headers = [
+        "id",
+        "vulnerabilityExternalId",
+        "vulnerableAsset.id",
+        "description",
+        "firstDetectedAt",
+    ]
+
+    worksheet.append(headers)
+
+    worksheet.append([
+        "wiz-vf-000001",
+        "CVE-2099-20001",
+        "wiz-asset-000001",
+        "Synthetic test finding",
+        "2026-08-02T16:00:00Z",
+    ])
+
+    workbook.save(file_path)
+    workbook.close()
+
+    result = process_source_data(file_path, "WIZ")
+
+    assert len(result.accepted_records) == 1
+    assert len(result.rejected_records) == 0
+
+    finding, raw_record = result.accepted_records[0]
+
+    assert finding.source_finding_id == "wiz-vf-000001"
+    assert finding.cvss_base is None
+    assert "score" not in raw_record
 
 def test_wiz_score_above_cvss_range_is_rejected() -> None:
     """
