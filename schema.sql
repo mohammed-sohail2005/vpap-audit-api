@@ -160,7 +160,10 @@ CREATE TABLE IF NOT EXISTS enrichment_run (
 -- provenance are never lost.
 CREATE TABLE IF NOT EXISTS finding_evidence (
     evidence_snapshot_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    finding_instance_id      uuid NOT NULL REFERENCES finding_instance(id),
+    finding_instance_id      text NOT NULL,   -- plain text for now, not a FK - finding_instance
+                                                -- table doesn't exist yet (pending Muizz's schema).
+                                                -- Change to `uuid REFERENCES finding_instance(id)`
+                                                -- once his ingestion tables are confirmed and built.
     source_finding_id        text NOT NULL,
     tenant_id                 text NOT NULL DEFAULT 'default',
     source_system             text NOT NULL,
