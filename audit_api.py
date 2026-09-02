@@ -22,7 +22,7 @@ Run locally with:
     py -m uvicorn audit_api:app --host 0.0.0.0 --port 8000
 """
 
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import logging
@@ -30,11 +30,16 @@ import logging
 from audit_client import (
     AuditClient,
     FindingInstance,
-    EvidenceSnapshot,
     PriorityDecision,
     HumanDecision,
     ExceptionRecord,
     AuditEvent as DBAuditEvent,
+    EvidenceValue,
+    CompensatingControl,
+    EnrichmentRun,
+    FindingEvidence as DBFindingEvidence,
+    KevCatalogue,
+    KevCatalogueEntry,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -67,12 +72,70 @@ class FindingRequest(BaseModel):
     status: str = "NEW"
 
 
-class EvidenceRequest(BaseModel):
-    finding_id: str
-    source_name: str
-    status: EvidenceStatus
-    payload: dict
-    source_snapshot_at: Optional[str] = None
+class EvidenceValueRequest(BaseModel):
+    value: Optional[Any] = None
+    raw_value: Optional[Any] = None
+    mapping_version: Optional[str] = None
+    status: Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
+    reason_code: Optional[str] = None
+    source: str
+    source_field: Optional[str] = None
+    source_timestamp: Optional[str] = None
+    retrieved_at: str
+    confidence: Literal["HIGH", "MEDIUM", "LOW"]
+
+
+class EnrichmentRunRequest(BaseModel):
+    tenant_id: str = "default"
+    source_system: str
+    source_instance_id: Optional[str] = None
+    adapter_name: str
+    adapter_version: str
+    schema_version: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    status: str
+
+
+class FindingEvidenceRequest(BaseModel):
+    finding_instance_id: str
+    source_finding_id: str
+    tenant_id: str = "default"
+    source_system: str
+    source_instance_id: Optional[str] = None
+    enrichment_run_id: str
+    schema_version: str
+    adapter_name: str
+    adapter_version: str
+
+    cve_id: str
+    asset_id: str
+    cvss_base: Optional[float] = None
+
+    epss_probability: EvidenceValueRequest
+    epss_percentile: EvidenceValueRequest
+    kev_status: EvidenceValueRequest
+    internet_exposure: EvidenceValueRequest
+    runtime_applicability: EvidenceValueRequest
+    attack_path_reachable: EvidenceValueRequest
+    business_criticality: EvidenceValueRequest
+    compensating_controls: EvidenceValueRequest
+
+
+class KevCatalogueRequest(BaseModel):
+    source_timestamp: Optional[str] = None
+    catalogue_sha256: str
+    record_count: int
+    status: str
+
+
+class KevCatalogueEntryRequest(BaseModel):
+    catalogue_id: str
+    cve_id: str
+
+
+class KevCatalogueEntriesRequest(BaseModel):
+    entries: list[KevCatalogueEntryRequest]
 
 
 class DecisionRequest(BaseModel):
@@ -158,20 +221,78 @@ def get_finding_history(finding_id: str):
 
 
 # ============================================================
-# evidence_snapshot - Anafa (enrichment)
+# Enrichment tables - Anafa
 # ============================================================
 
-@app.post("/evidence")
-def create_evidence(evidence: EvidenceRequest):
-    """Record one enrichment source's result (EPSS, KEV, CMDB, etc.) for a finding."""
+@app.post("/enrichment-runs")
+def create_enrichment_run(run: EnrichmentRunRequest):
+    """Start/record one enrichment batch run. Returns enrichment_run_id to reuse across the batch."""
     try:
-        db_evidence = EvidenceSnapshot(**evidence.model_dump())
-        evidence_id = audit_client.log_evidence(db_evidence)
-        logger.info(f"Logged evidence: id={evidence_id} finding_id={evidence.finding_id} source={evidence.source_name}")
+        db_run = EnrichmentRun(**run.model_dump())
+        run_id = audit_client.log_enrichment_run(db_run)
+        logger.info(f"Logged enrichment run: id={run_id} adapter={run.adapter_name}")
+        return {"status": "ok", "enrichment_run_id": run_id}
+    except Exception as e:
+        logger.error(f"Failed to log enrichment run: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record enrichment run.")
+
+
+@app.post("/evidence")
+def create_finding_evidence(evidence: FindingEvidenceRequest):
+    """
+    Record the complete evidence for one finding (EPSS, KEV, exposure,
+    runtime applicability, attack path, business criticality,
+    compensating controls) - each as a full EvidenceValue with
+    value/status/reason_code/provenance, never a bare value.
+    """
+    try:
+        db_evidence = DBFindingEvidence(
+            **evidence.model_dump(exclude={
+                "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
+                "runtime_applicability", "attack_path_reachable", "business_criticality",
+                "compensating_controls",
+            }),
+            epss_probability=EvidenceValue(**evidence.epss_probability.model_dump()),
+            epss_percentile=EvidenceValue(**evidence.epss_percentile.model_dump()),
+            kev_status=EvidenceValue(**evidence.kev_status.model_dump()),
+            internet_exposure=EvidenceValue(**evidence.internet_exposure.model_dump()),
+            runtime_applicability=EvidenceValue(**evidence.runtime_applicability.model_dump()),
+            attack_path_reachable=EvidenceValue(**evidence.attack_path_reachable.model_dump()),
+            business_criticality=EvidenceValue(**evidence.business_criticality.model_dump()),
+            compensating_controls=EvidenceValue(**evidence.compensating_controls.model_dump()),
+        )
+        evidence_id = audit_client.log_finding_evidence(db_evidence)
+        logger.info(f"Logged finding evidence: id={evidence_id} finding_instance_id={evidence.finding_instance_id}")
         return {"status": "ok", "evidence_snapshot_id": evidence_id}
     except Exception as e:
-        logger.error(f"Failed to log evidence: {e}")
-        raise HTTPException(status_code=500, detail="Failed to record evidence.")
+        logger.error(f"Failed to log finding evidence: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record finding evidence.")
+
+
+@app.post("/kev-catalogue")
+def create_kev_catalogue(catalogue: KevCatalogueRequest):
+    """Record one downloaded KEV catalogue snapshot. Returns catalogue_id to attach entries to."""
+    try:
+        db_catalogue = KevCatalogue(**catalogue.model_dump())
+        catalogue_id = audit_client.log_kev_catalogue(db_catalogue)
+        logger.info(f"Logged KEV catalogue: id={catalogue_id} record_count={catalogue.record_count}")
+        return {"status": "ok", "catalogue_id": catalogue_id}
+    except Exception as e:
+        logger.error(f"Failed to log KEV catalogue: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record KEV catalogue.")
+
+
+@app.post("/kev-catalogue-entries")
+def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest):
+    """Bulk-insert the CVEs listed in a KEV catalogue snapshot. Duplicates are silently skipped."""
+    try:
+        db_entries = [KevCatalogueEntry(**e.model_dump()) for e in request.entries]
+        count = audit_client.log_kev_catalogue_entries(db_entries)
+        logger.info(f"Logged {count} KEV catalogue entries")
+        return {"status": "ok", "entries_inserted": count}
+    except Exception as e:
+        logger.error(f"Failed to log KEV catalogue entries: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record KEV catalogue entries.")
 
 
 # ============================================================

@@ -56,15 +56,88 @@ class FindingInstance(BaseModel):
         return hashlib.sha256(material.encode()).hexdigest()
 
 
-class EvidenceSnapshot(BaseModel):
-    finding_id: str  # uuid of finding_instance, as text
-    source_name: str  # e.g. 'FIRST_EPSS', 'CISA_KEV', 'CMDB'
-    status: EvidenceStatus
-    payload: dict
-    source_snapshot_at: Optional[str] = None
+# ============================================================
+# Enrichment models (Anafa) - mirror her Pydantic contract exactly
+# ============================================================
 
-    def payload_sha256(self) -> str:
-        return hashlib.sha256(json.dumps(self.payload, sort_keys=True).encode()).hexdigest()
+from typing import Generic, TypeVar, Any
+from datetime import datetime
+
+T = TypeVar("T")
+
+
+class EvidenceValue(BaseModel, Generic[T]):
+    """One piece of evidence and its provenance. UNKNOWN != False/0."""
+    value: Optional[T] = None
+    raw_value: Optional[Any] = None
+    mapping_version: Optional[str] = None
+    status: Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
+    reason_code: Optional[str] = None
+    source: str
+    source_field: Optional[str] = None
+    source_timestamp: Optional[datetime] = None
+    retrieved_at: datetime
+    confidence: Literal["HIGH", "MEDIUM", "LOW"]
+
+
+class CompensatingControl(BaseModel):
+    type: str
+    status: str
+    scope: Optional[str] = None
+    source: str
+    verified_at: Optional[datetime] = None
+    relationship: Optional[str] = None
+
+
+class EnrichmentRun(BaseModel):
+    tenant_id: str = "default"
+    source_system: str
+    source_instance_id: Optional[str] = None
+    adapter_name: str
+    adapter_version: str
+    schema_version: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    status: str
+
+
+class FindingEvidence(BaseModel):
+    """Complete evidence record for one vulnerability finding."""
+    finding_instance_id: str
+    source_finding_id: str
+    tenant_id: str = "default"
+    source_system: str
+    source_instance_id: Optional[str] = None
+    enrichment_run_id: str
+    schema_version: str
+    adapter_name: str
+    adapter_version: str
+    evidence_snapshot_sha256: str
+
+    cve_id: str
+    asset_id: str
+    cvss_base: Optional[float] = None
+
+    epss_probability: EvidenceValue
+    epss_percentile: EvidenceValue
+    kev_status: EvidenceValue
+    internet_exposure: EvidenceValue
+    runtime_applicability: EvidenceValue
+    attack_path_reachable: EvidenceValue
+    business_criticality: EvidenceValue
+    compensating_controls: EvidenceValue
+
+
+class KevCatalogue(BaseModel):
+    source_timestamp: Optional[str] = None
+    catalogue_sha256: str
+    record_count: int
+    status: str
+
+
+class KevCatalogueEntry(BaseModel):
+    catalogue_id: str
+    cve_id: str
 
 
 class PriorityDecision(BaseModel):
@@ -157,34 +230,111 @@ class AuditClient:
             conn.commit()
         return str(row[0])
 
-    # -------------------- evidence_snapshot --------------------
+    # -------------------- enrichment_run --------------------
 
-    def log_evidence(self, evidence: EvidenceSnapshot) -> str:
-        """Insert one evidence_snapshot row. Returns its id (uuid as text)."""
+    def log_enrichment_run(self, run: EnrichmentRun) -> str:
+        """Insert one enrichment_run row. Returns its enrichment_run_id."""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO evidence_snapshot
-                        (finding_id, source_name, source_snapshot_at, retrieved_at,
-                         status, payload, payload_sha256)
+                    INSERT INTO enrichment_run
+                        (tenant_id, source_system, source_instance_id, adapter_name,
+                         adapter_version, schema_version, started_at, completed_at, status)
                     VALUES
-                        (%(finding_id)s, %(source_name)s, %(source_snapshot_at)s, now(),
-                         %(status)s, %(payload)s, %(payload_sha256)s)
-                    RETURNING id
+                        (%(tenant_id)s, %(source_system)s, %(source_instance_id)s, %(adapter_name)s,
+                         %(adapter_version)s, %(schema_version)s, %(started_at)s, %(completed_at)s, %(status)s)
+                    RETURNING enrichment_run_id
                     """,
-                    {
-                        "finding_id": evidence.finding_id,
-                        "source_name": evidence.source_name,
-                        "source_snapshot_at": evidence.source_snapshot_at,
-                        "status": evidence.status,
-                        "payload": Json(evidence.payload),
-                        "payload_sha256": evidence.payload_sha256(),
-                    },
+                    run.model_dump(),
                 )
                 row = cur.fetchone()
             conn.commit()
         return str(row[0])
+
+    # -------------------- finding_evidence --------------------
+
+    def log_finding_evidence(self, evidence: FindingEvidence) -> str:
+        """Insert one finding_evidence row. Returns its evidence_snapshot_id."""
+        evidence_fields = [
+            "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
+            "runtime_applicability", "attack_path_reachable", "business_criticality",
+            "compensating_controls",
+        ]
+        payload = evidence.model_dump(mode="json", exclude=set(evidence_fields))
+        for f in evidence_fields:
+            payload[f] = Json(getattr(evidence, f).model_dump(mode="json"))
+
+        # evidence_snapshot_sha256 is computed from the full evidence payload,
+        # so it's tamper-evident - recompute here rather than trusting a
+        # caller-supplied hash.
+        hashable = evidence.model_dump(mode="json")
+        computed_sha256 = hashlib.sha256(json.dumps(hashable, sort_keys=True).encode()).hexdigest()
+        payload["evidence_snapshot_sha256"] = computed_sha256
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO finding_evidence
+                        (finding_instance_id, source_finding_id, tenant_id, source_system,
+                         source_instance_id, enrichment_run_id, schema_version, adapter_name,
+                         adapter_version, evidence_snapshot_sha256, cve_id, asset_id, cvss_base,
+                         epss_probability, epss_percentile, kev_status, internet_exposure,
+                         runtime_applicability, attack_path_reachable, business_criticality,
+                         compensating_controls)
+                    VALUES
+                        (%(finding_instance_id)s, %(source_finding_id)s, %(tenant_id)s, %(source_system)s,
+                         %(source_instance_id)s, %(enrichment_run_id)s, %(schema_version)s, %(adapter_name)s,
+                         %(adapter_version)s, %(evidence_snapshot_sha256)s, %(cve_id)s, %(asset_id)s, %(cvss_base)s,
+                         %(epss_probability)s, %(epss_percentile)s, %(kev_status)s, %(internet_exposure)s,
+                         %(runtime_applicability)s, %(attack_path_reachable)s, %(business_criticality)s,
+                         %(compensating_controls)s)
+                    RETURNING evidence_snapshot_id
+                    """,
+                    payload,
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return str(row[0])
+
+    # -------------------- kev_catalogue --------------------
+
+    def log_kev_catalogue(self, catalogue: KevCatalogue) -> str:
+        """Insert one kev_catalogue snapshot row. Returns its catalogue_id."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO kev_catalogue
+                        (source_timestamp, catalogue_sha256, record_count, status)
+                    VALUES
+                        (%(source_timestamp)s, %(catalogue_sha256)s, %(record_count)s, %(status)s)
+                    RETURNING catalogue_id
+                    """,
+                    catalogue.model_dump(),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return str(row[0])
+
+    def log_kev_catalogue_entries(self, entries: list[KevCatalogueEntry]) -> int:
+        """Bulk-insert kev_catalogue_entry rows. Returns count inserted (duplicates skipped)."""
+        if not entries:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO kev_catalogue_entry (catalogue_id, cve_id)
+                    VALUES (%(catalogue_id)s, %(cve_id)s)
+                    ON CONFLICT (catalogue_id, cve_id) DO NOTHING
+                    """,
+                    [e.model_dump() for e in entries],
+                )
+                count = cur.rowcount
+            conn.commit()
+        return count
 
     # -------------------- priority_decision --------------------
 

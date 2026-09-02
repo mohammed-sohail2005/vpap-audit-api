@@ -135,6 +135,86 @@ CREATE INDEX IF NOT EXISTS idx_audit_occurred_at ON audit_event (occurred_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action      ON audit_event (action);
 
 -- ============================================================
+-- ENRICHMENT TABLES (Anafa) - exact spec from her PR/design
+-- ============================================================
+
+-- One row per enrichment batch run
+CREATE TABLE IF NOT EXISTS enrichment_run (
+    enrichment_run_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id            text NOT NULL DEFAULT 'default',
+    source_system        text NOT NULL,
+    source_instance_id   text,
+    adapter_name         text NOT NULL,
+    adapter_version      text NOT NULL,
+    schema_version       text NOT NULL,
+    started_at           timestamptz,
+    completed_at         timestamptz,
+    status                text NOT NULL,      -- e.g. 'RUNNING' | 'COMPLETED' | 'FAILED'
+    created_at            timestamptz NOT NULL DEFAULT now()
+);
+
+-- One row per enriched finding. Each *_JSON column stores a full
+-- EvidenceValue object: {value, raw_value, mapping_version, status,
+-- reason_code, source, source_field, source_timestamp, retrieved_at,
+-- confidence} - never just a bare value, so UNKNOWN/STALE/ERROR and
+-- provenance are never lost.
+CREATE TABLE IF NOT EXISTS finding_evidence (
+    evidence_snapshot_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    finding_instance_id      uuid NOT NULL REFERENCES finding_instance(id),
+    source_finding_id        text NOT NULL,
+    tenant_id                 text NOT NULL DEFAULT 'default',
+    source_system             text NOT NULL,
+    source_instance_id        text,
+    enrichment_run_id         uuid NOT NULL REFERENCES enrichment_run(enrichment_run_id),
+    schema_version             text NOT NULL,
+    adapter_name               text NOT NULL,
+    adapter_version            text NOT NULL,
+    evidence_snapshot_sha256   text NOT NULL,
+
+    cve_id                     text NOT NULL,
+    asset_id                   text NOT NULL,
+    cvss_base                  numeric(3,1),
+
+    epss_probability           jsonb NOT NULL,   -- EvidenceValue[float]
+    epss_percentile            jsonb NOT NULL,   -- EvidenceValue[float]
+    kev_status                 jsonb NOT NULL,   -- EvidenceValue[bool]
+    internet_exposure          jsonb NOT NULL,   -- EvidenceValue[bool]
+    runtime_applicability      jsonb NOT NULL,   -- EvidenceValue[bool]
+    attack_path_reachable      jsonb NOT NULL,   -- EvidenceValue[bool]
+    business_criticality       jsonb NOT NULL,   -- EvidenceValue[str]
+    compensating_controls      jsonb NOT NULL,   -- EvidenceValue[list[CompensatingControl]]
+
+    created_at                 timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_finding_evidence_finding ON finding_evidence (finding_instance_id);
+CREATE INDEX IF NOT EXISTS idx_finding_evidence_run     ON finding_evidence (enrichment_run_id);
+CREATE INDEX IF NOT EXISTS idx_finding_evidence_cve     ON finding_evidence (cve_id);
+
+-- One row per downloaded KEV catalogue snapshot
+CREATE TABLE IF NOT EXISTS kev_catalogue (
+    catalogue_id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_timestamp     timestamptz,
+    retrieved_at          timestamptz NOT NULL DEFAULT now(),
+    catalogue_sha256      text NOT NULL,
+    record_count          integer NOT NULL,
+    status                 text NOT NULL,     -- e.g. 'OK' | 'STALE' | 'MALFORMED' | 'DOWNLOAD_FAILED'
+    created_at             timestamptz NOT NULL DEFAULT now()
+);
+
+-- One row per CVE listed in a given KEV catalogue snapshot
+CREATE TABLE IF NOT EXISTS kev_catalogue_entry (
+    catalogue_entry_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    catalogue_id          uuid NOT NULL REFERENCES kev_catalogue(catalogue_id),
+    cve_id                 text NOT NULL,
+    created_at              timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (catalogue_id, cve_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kev_catalogue_entry_cve ON kev_catalogue_entry (cve_id);
+
+GRANT SELECT, INSERT, UPDATE ON enrichment_run, finding_evidence, kev_catalogue, kev_catalogue_entry TO vpap_app;
+-- ============================================================
 -- Access control: one restricted role for the application.
 -- audit_event is INSERT/SELECT only (append-only, enforced at the
 -- DB level). Other tables allow UPDATE where the design calls for
