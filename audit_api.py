@@ -29,6 +29,9 @@ import logging
 
 from audit_client import (
     AuditClient,
+    FindingInstance,
+    IngestionBatch,
+    DeadLetter,
     AuditEvent as DBAuditEvent,
     EvidenceValue,
     CompensatingControl,
@@ -57,6 +60,51 @@ EvidenceStatus = Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
 # ============================================================
 # Request models (mirror audit_client models 1:1)
 # ============================================================
+
+class IngestionBatchRequest(BaseModel):
+    tenant_id: str
+    source_system: str
+    source_type: str
+    source_reference: Optional[str] = None
+    source_file_name: Optional[str] = None
+    total_records: int = 0
+    accepted_records: int = 0
+    rejected_records: int = 0
+    validation_failed_records: int = 0
+    status: str = "RECEIVED"
+    error_message: Optional[str] = None
+
+
+class FindingRequest(BaseModel):
+    tenant_id: str = "default"
+    source_system: str
+    source_finding_id: str
+    cve_id: str
+    asset_id: str
+    package_id: Optional[str] = None
+
+    cvss_base: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    description: Optional[str] = None
+    business_service_id: Optional[str] = None
+    internet_exposed: Optional[bool] = None
+    first_detected_at: Optional[str] = None
+
+    status: str = "VALID"
+
+
+class DeadLetterRequest(BaseModel):
+    tenant_id: str
+    source_system: str
+    batch_id: Optional[str] = None
+    source_finding_id: Optional[str] = None
+    stage: str
+    error_code: str
+    error_message: str
+    raw_record: Optional[dict] = None
+    status: str = "OPEN"
+    retry_count: int = 0
+
 
 class EvidenceValueRequest(BaseModel):
     value: Optional[Any] = None
@@ -149,11 +197,77 @@ def health_check():
 
 # ============================================================
 # finding_instance - Muizz (ingestion/validation)
-# PENDING: table dropped, endpoints removed until his real
 # 3-table spec is confirmed and schema.sql is updated to match.
 # ============================================================
 
+@app.post("/ingestion-batches")
+def create_ingestion_batch(batch: IngestionBatchRequest):
+    try:
+        db_batch = IngestionBatch(**batch.model_dump())
+        batch_id = audit_client.create_ingestion_batch(db_batch)
 
+        logger.info(f"Created ingestion batch: id={batch_id}")
+
+        return {
+            "status": "ok",
+            "batch_id": batch_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to create ingestion batch: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to record ingestion batch.",
+        )
+
+
+@app.post("/findings")
+def create_finding(finding: FindingRequest):
+    try:
+        db_finding = FindingInstance(**finding.model_dump())
+        finding_id = audit_client.upsert_finding(db_finding)
+
+        logger.info(
+            f"Upserted finding: id={finding_id} "
+            f"cve={finding.cve_id}"
+        )
+
+        return {
+            "status": "ok",
+            "finding_id": finding_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to upsert finding: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to record finding.",
+        )
+
+
+@app.post("/dead-letters")
+def create_dead_letter(dead_letter: DeadLetterRequest):
+    try:
+        db_dead_letter = DeadLetter(**dead_letter.model_dump())
+        dead_letter_id = audit_client.create_dead_letter(db_dead_letter)
+
+        logger.info(
+            f"Created dead letter: id={dead_letter_id} "
+            f"stage={dead_letter.stage}"
+        )
+
+        return {
+            "status": "ok",
+            "dead_letter_id": dead_letter_id,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to create dead letter: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to record dead letter.",
+        )
+        
 # ============================================================
 # Enrichment tables - Anafa
 # ============================================================
