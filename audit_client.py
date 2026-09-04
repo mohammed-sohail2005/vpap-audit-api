@@ -41,6 +41,33 @@ EvidenceStatus = Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
 # Models - one per table
 # ============================================================
 
+class IngestionBatch(BaseModel):
+    tenant_id: str
+    source_system: str
+    source_type: str
+    source_reference: Optional[str] = None
+    source_file_name: Optional[str] = None
+    total_records: int = 0
+    accepted_records: int = 0
+    rejected_records: int = 0
+    validation_failed_records: int = 0
+    status: str = "RECEIVED"
+    error_message: Optional[str] = None
+
+
+class DeadLetter(BaseModel):
+    tenant_id: str
+    source_system: str
+    batch_id: Optional[str] = None
+    source_finding_id: Optional[str] = None
+    stage: str
+    error_code: str
+    error_message: str
+    raw_record: Optional[dict] = None
+    status: str = "OPEN"
+    retry_count: int = 0
+
+
 class FindingInstance(BaseModel):
     tenant_id: str = "default"
     source_system: str
@@ -48,11 +75,23 @@ class FindingInstance(BaseModel):
     cve_id: str
     asset_id: str
     package_id: Optional[str] = None
-    status: str = "NEW"
+
+    cvss_base: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    description: Optional[str] = None
+    business_service_id: Optional[str] = None
+    internet_exposed: Optional[bool] = None
+    first_detected_at: Optional[str] = None
+
+    status: str = "VALID"
 
     def idempotency_key(self) -> str:
-        """Matches Finding.idempotency_key() from the Build Guide's domain model."""
-        material = "|".join([self.source_system, self.source_finding_id, self.asset_id, self.package_id or "-"])
+        material = "|".join([
+            self.source_system,
+            self.source_finding_id,
+            self.asset_id,
+            self.package_id or "-",
+        ])
         return hashlib.sha256(material.encode()).hexdigest()
 
 
@@ -203,33 +242,173 @@ class AuditClient:
 
     def upsert_finding(self, finding: FindingInstance) -> str:
         """
-        Insert a finding, or return the existing row's id if this exact
-        (tenant, idempotency_key) already exists - matches the domain
-        model's idempotency contract so re-ingesting the same finding
-        never creates a duplicate.
-        Returns the finding_instance.id (uuid as text).
+        Insert a finding or return the existing row's id for the same
+        tenant + idempotency key.
         """
         key = finding.idempotency_key()
+    
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO finding_instance
-                        (tenant_id, idempotency_key, source_system, source_finding_id,
-                         cve_id, asset_id, package_id, status, first_seen_at, last_seen_at)
+                        (
+                            tenant_id,
+                            idempotency_key,
+                            source_system,
+                            source_finding_id,
+                            cve_id,
+                            asset_id,
+                            package_id,
+                            cvss_base,
+                            cvss_vector,
+                            description,
+                            business_service_id,
+                            internet_exposed,
+                            first_detected_at,
+                            status,
+                            first_seen_at,
+                            last_seen_at,
+                            created_at,
+                            updated_at
+                        )
                     VALUES
-                        (%(tenant_id)s, %(idempotency_key)s, %(source_system)s, %(source_finding_id)s,
-                         %(cve_id)s, %(asset_id)s, %(package_id)s, %(status)s, now(), now())
+                        (
+                            %(tenant_id)s,
+                            %(idempotency_key)s,
+                            %(source_system)s,
+                            %(source_finding_id)s,
+                            %(cve_id)s,
+                            %(asset_id)s,
+                            %(package_id)s,
+                            %(cvss_base)s,
+                            %(cvss_vector)s,
+                            %(description)s,
+                            %(business_service_id)s,
+                            %(internet_exposed)s,
+                            %(first_detected_at)s,
+                            %(status)s,
+                            now(),
+                            now(),
+                            now(),
+                            now()
+                        )
                     ON CONFLICT (tenant_id, idempotency_key)
-                    DO UPDATE SET last_seen_at = now(), status = EXCLUDED.status
+                    DO UPDATE SET
+                        last_seen_at = now(),
+                        updated_at = now(),
+                        status = EXCLUDED.status
                     RETURNING id
                     """,
-                    {**finding.model_dump(), "idempotency_key": key},
+                    {
+                        **finding.model_dump(),
+                        "idempotency_key": key,
+                    },
                 )
+    
                 row = cur.fetchone()
+    
             conn.commit()
+    
         return str(row[0])
 
+    # -------------------- ingesion_batch --------------------
+
+    def create_ingestion_batch(self, batch: IngestionBatch) -> str:
+    with self._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ingestion_batch
+                    (
+                        tenant_id,
+                        source_system,
+                        source_type,
+                        source_reference,
+                        source_file_name,
+                        total_records,
+                        accepted_records,
+                        rejected_records,
+                        validation_failed_records,
+                        status,
+                        error_message
+                    )
+                VALUES
+                    (
+                        %(tenant_id)s,
+                        %(source_system)s,
+                        %(source_type)s,
+                        %(source_reference)s,
+                        %(source_file_name)s,
+                        %(total_records)s,
+                        %(accepted_records)s,
+                        %(rejected_records)s,
+                        %(validation_failed_records)s,
+                        %(status)s,
+                        %(error_message)s
+                    )
+                RETURNING id
+                """,
+                batch.model_dump(),
+            )
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+    return str(row[0])
+
+    # -------------------- dead_letter -----------------------
+
+    def create_dead_letter(self, dead_letter: DeadLetter) -> str:
+    with self._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dead_letter
+                    (
+                        tenant_id,
+                        source_system,
+                        batch_id,
+                        source_finding_id,
+                        stage,
+                        error_code,
+                        error_message,
+                        raw_record,
+                        status,
+                        retry_count
+                    )
+                VALUES
+                    (
+                        %(tenant_id)s,
+                        %(source_system)s,
+                        %(batch_id)s,
+                        %(source_finding_id)s,
+                        %(stage)s,
+                        %(error_code)s,
+                        %(error_message)s,
+                        %(raw_record)s,
+                        %(status)s,
+                        %(retry_count)s
+                    )
+                RETURNING id
+                """,
+                {
+                    **dead_letter.model_dump(exclude={"raw_record"}),
+                    "raw_record": (
+                        Json(dead_letter.raw_record)
+                        if dead_letter.raw_record is not None
+                        else None
+                    ),
+                },
+            )
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+    return str(row[0])
+    
     # -------------------- enrichment_run --------------------
 
     def log_enrichment_run(self, run: EnrichmentRun) -> str:
