@@ -315,99 +315,99 @@ class AuditClient:
     # -------------------- ingesion_batch --------------------
 
     def create_ingestion_batch(self, batch: IngestionBatch) -> str:
-    with self._connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ingestion_batch
-                    (
-                        tenant_id,
-                        source_system,
-                        source_type,
-                        source_reference,
-                        source_file_name,
-                        total_records,
-                        accepted_records,
-                        rejected_records,
-                        validation_failed_records,
-                        status,
-                        error_message
-                    )
-                VALUES
-                    (
-                        %(tenant_id)s,
-                        %(source_system)s,
-                        %(source_type)s,
-                        %(source_reference)s,
-                        %(source_file_name)s,
-                        %(total_records)s,
-                        %(accepted_records)s,
-                        %(rejected_records)s,
-                        %(validation_failed_records)s,
-                        %(status)s,
-                        %(error_message)s
-                    )
-                RETURNING id
-                """,
-                batch.model_dump(),
-            )
-
-            row = cur.fetchone()
-
-        conn.commit()
-
-    return str(row[0])
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ingestion_batch
+                        (
+                            tenant_id,
+                            source_system,
+                            source_type,
+                            source_reference,
+                            source_file_name,
+                            total_records,
+                            accepted_records,
+                            rejected_records,
+                            validation_failed_records,
+                            status,
+                            error_message
+                        )
+                    VALUES
+                        (
+                            %(tenant_id)s,
+                            %(source_system)s,
+                            %(source_type)s,
+                            %(source_reference)s,
+                            %(source_file_name)s,
+                            %(total_records)s,
+                            %(accepted_records)s,
+                            %(rejected_records)s,
+                            %(validation_failed_records)s,
+                            %(status)s,
+                            %(error_message)s
+                        )
+                    RETURNING id
+                    """,
+                    batch.model_dump(),
+                )
+    
+                row = cur.fetchone()
+    
+            conn.commit()
+    
+        return str(row[0])
 
     # -------------------- dead_letter -----------------------
 
     def create_dead_letter(self, dead_letter: DeadLetter) -> str:
-    with self._connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO dead_letter
-                    (
-                        tenant_id,
-                        source_system,
-                        batch_id,
-                        source_finding_id,
-                        stage,
-                        error_code,
-                        error_message,
-                        raw_record,
-                        status,
-                        retry_count
-                    )
-                VALUES
-                    (
-                        %(tenant_id)s,
-                        %(source_system)s,
-                        %(batch_id)s,
-                        %(source_finding_id)s,
-                        %(stage)s,
-                        %(error_code)s,
-                        %(error_message)s,
-                        %(raw_record)s,
-                        %(status)s,
-                        %(retry_count)s
-                    )
-                RETURNING id
-                """,
-                {
-                    **dead_letter.model_dump(exclude={"raw_record"}),
-                    "raw_record": (
-                        Json(dead_letter.raw_record)
-                        if dead_letter.raw_record is not None
-                        else None
-                    ),
-                },
-            )
-
-            row = cur.fetchone()
-
-        conn.commit()
-
-    return str(row[0])
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO dead_letter
+                        (
+                            tenant_id,
+                            source_system,
+                            batch_id,
+                            source_finding_id,
+                            stage,
+                            error_code,
+                            error_message,
+                            raw_record,
+                            status,
+                            retry_count
+                        )
+                    VALUES
+                        (
+                            %(tenant_id)s,
+                            %(source_system)s,
+                            %(batch_id)s,
+                            %(source_finding_id)s,
+                            %(stage)s,
+                            %(error_code)s,
+                            %(error_message)s,
+                            %(raw_record)s,
+                            %(status)s,
+                            %(retry_count)s
+                        )
+                    RETURNING id
+                    """,
+                    {
+                        **dead_letter.model_dump(exclude={"raw_record"}),
+                        "raw_record": (
+                            Json(dead_letter.raw_record)
+                            if dead_letter.raw_record is not None
+                            else None
+                        ),
+                    },
+                )
+    
+                row = cur.fetchone()
+    
+            conn.commit()
+    
+        return str(row[0])
     
     # -------------------- enrichment_run --------------------
 
