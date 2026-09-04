@@ -18,14 +18,121 @@ CREATE TABLE IF NOT EXISTS finding_instance (
     cve_id              text NOT NULL,
     asset_id            text NOT NULL,
     package_id          text,
-    status              text NOT NULL DEFAULT 'NEW',
+
+    cvss_base           numeric(3,1),
+    cvss_vector         text,
+    description         text,
+    business_service_id text,
+    internet_exposed    boolean,
+    first_detected_at   timestamptz,
+
+    status              text NOT NULL DEFAULT 'VALID',
     first_seen_at       timestamptz,
     last_seen_at        timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, idempotency_key)
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT finding_instance_tenant_idempotency_unique
+        UNIQUE (tenant_id, idempotency_key),
+
+    CONSTRAINT finding_instance_cvss_check
+        CHECK (cvss_base IS NULL OR (cvss_base >= 0 AND cvss_base <= 10)),
+
+    CONSTRAINT finding_instance_source_system_check
+        CHECK (source_system = UPPER(source_system))
 );
 
 CREATE INDEX IF NOT EXISTS idx_finding_instance_cve   ON finding_instance (cve_id);
 CREATE INDEX IF NOT EXISTS idx_finding_instance_asset ON finding_instance (asset_id);
+
+
+CREATE TABLE IF NOT EXISTS ingestion_batch (
+    id                         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id                  text NOT NULL,
+    source_system              text NOT NULL,
+    source_type                text NOT NULL,
+    source_reference           text,
+    source_file_name           text,
+
+    received_at                timestamptz NOT NULL DEFAULT now(),
+    processing_started_at      timestamptz,
+    processing_completed_at   timestamptz,
+
+    total_records              integer NOT NULL DEFAULT 0,
+    accepted_records           integer NOT NULL DEFAULT 0,
+    rejected_records           integer NOT NULL DEFAULT 0,
+    validation_failed_records  integer NOT NULL DEFAULT 0,
+
+    status                     text NOT NULL DEFAULT 'RECEIVED',
+    error_message              text,
+    created_at                 timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT ingestion_batch_source_type_check
+        CHECK (source_type IN ('FILE', 'API', 'STREAM')),
+
+    CONSTRAINT ingestion_batch_status_check
+        CHECK (status IN (
+            'RECEIVED',
+            'PROCESSING',
+            'COMPLETED',
+            'PARTIAL',
+            'FAILED'
+        )),
+
+    CONSTRAINT ingestion_batch_counts_check
+        CHECK (
+            total_records >= 0
+            AND accepted_records >= 0
+            AND rejected_records >= 0
+            AND validation_failed_records >= 0
+        ),
+
+    CONSTRAINT ingestion_batch_source_system_check
+        CHECK (source_system = UPPER(source_system))
+);
+
+
+CREATE TABLE IF NOT EXISTS dead_letter (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           text NOT NULL,
+    source_system       text NOT NULL,
+    batch_id            uuid,
+
+    source_finding_id   text,
+    stage               text NOT NULL,
+    error_code          text NOT NULL,
+    error_message       text NOT NULL,
+    raw_record          jsonb,
+
+    status              text NOT NULL DEFAULT 'OPEN',
+    retry_count         integer NOT NULL DEFAULT 0,
+
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    resolved_at         timestamptz,
+
+    CONSTRAINT dead_letter_batch_fk
+        FOREIGN KEY (batch_id)
+        REFERENCES ingestion_batch(id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT dead_letter_stage_check
+        CHECK (stage IN ('INGESTION', 'VALIDATION')),
+
+    CONSTRAINT dead_letter_status_check
+        CHECK (status IN (
+            'OPEN',
+            'REPROCESSED',
+            'RESOLVED',
+            'IGNORED'
+        )),
+
+    CONSTRAINT dead_letter_retry_count_check
+        CHECK (retry_count >= 0),
+
+    CONSTRAINT dead_letter_source_system_check
+        CHECK (source_system = UPPER(source_system))
+);
 
 -- ============================================================
 -- evidence_snapshot: enrichment results (EPSS, KEV, exposure,
