@@ -1,22 +1,18 @@
 """
-VPAP 4.1 - Audit/data API service
+VPAP 4.1 - Full data & audit API
 ------------------------------------
-Exposes the proper VPAP data model as HTTP endpoints, so Muizz
-(ingestion/validation), Anafa (enrichment), and Vignesh (policy engine)
-can write into the shared Supabase database without ever holding
-database credentials themselves.
+One REST endpoint per table, so Muizz, Anafa, Vignesh, and I never need
+direct database credentials. Everyone calls this API; this service is
+the only thing holding the real Supabase connection string.
 
-Endpoints map 1:1 to the design doc's tables:
-
-    POST /findings              -> finding_instance   (Muizz - ingestion)
-    POST /evidence               -> evidence_snapshot   (Anafa - enrichment)
-    POST /decisions               -> priority_decision   (Vignesh - policy engine)
-    POST /human-decisions         -> human_decision       (HITL review)
-    POST /exceptions              -> exception_record     (HITL review)
-    POST /audit-events            -> audit_event          (everyone - the "what happened" trail)
-
-    GET  /findings/{finding_id}/history  -> full reconstructed story of one finding
-    GET  /audit-events/{correlation_id}  -> raw audit trail for one finding
+    Muizz (ingestion):   POST /ingestion-batches, POST /findings, POST /dead-letters
+    Anafa (enrichment):  POST /enrichment-runs, POST /evidence,
+                         POST /kev-catalogue, POST /kev-catalogue-entries
+    Vignesh (policy):    POST /policy-versions, POST /decisions,
+                         POST /human-decisions, POST /exceptions,
+                         POST /outbox-events, POST /ticket-links
+    Sohail (audit):      POST /audit-events, GET /audit-events/{correlation_id}
+    Everyone:            GET /findings/{finding_id}/history
 
 Run locally with:
     py -m uvicorn audit_api:app --host 0.0.0.0 --port 8000
@@ -29,16 +25,12 @@ import logging
 
 from audit_client import (
     AuditClient,
-    FindingInstance,
-    IngestionBatch,
-    DeadLetter,
+    IngestionBatch, FindingInstance, DeadLetter,
+    EvidenceValue, EnrichmentRun, FindingEvidence as DBFindingEvidence,
+    KevCatalogue, KevCatalogueEntry,
+    PolicyVersion, PriorityDecision, HumanDecision, ExceptionRecord,
+    OutboxEvent, TicketLink,
     AuditEvent as DBAuditEvent,
-    EvidenceValue,
-    CompensatingControl,
-    EnrichmentRun,
-    FindingEvidence as DBFindingEvidence,
-    KevCatalogue,
-    KevCatalogueEntry,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -46,27 +38,33 @@ logger = logging.getLogger("vpap-audit-api")
 
 app = FastAPI(
     title="VPAP Audit & Data API",
-    description="Internal endpoints for writing to the shared VPAP database (finding_instance, evidence_snapshot, priority_decision, human_decision, exception_record, audit_event).",
-    version="2.0.0",
+    description="Shared endpoints for ingestion, enrichment, policy engine, and audit data.",
+    version="3.0.0",
 )
 
 audit_client = AuditClient()
 
 ActorType = Literal["system", "human", "llm"]
 Priority = Literal["P0", "P1", "P2", "P3", "REVIEW"]
-EvidenceStatus = Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
+
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": "vpap-audit-api"}
 
 
 # ============================================================
-# Request models (mirror audit_client models 1:1)
+# MUIZZ - Ingestion & Validation
 # ============================================================
 
 class IngestionBatchRequest(BaseModel):
     tenant_id: str
     source_system: str
-    source_type: str
+    source_type: Literal["FILE", "API", "STREAM"]
     source_reference: Optional[str] = None
     source_file_name: Optional[str] = None
+    processing_started_at: Optional[str] = None
+    processing_completed_at: Optional[str] = None
     total_records: int = 0
     accepted_records: int = 0
     rejected_records: int = 0
@@ -75,22 +73,43 @@ class IngestionBatchRequest(BaseModel):
     error_message: Optional[str] = None
 
 
+@app.post("/ingestion-batches")
+def create_ingestion_batch(batch: IngestionBatchRequest):
+    try:
+        batch_id = audit_client.log_ingestion_batch(IngestionBatch(**batch.model_dump()))
+        logger.info(f"Logged ingestion batch: id={batch_id}")
+        return {"status": "ok", "batch_id": batch_id}
+    except Exception as e:
+        logger.error(f"Failed to log ingestion batch: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record ingestion batch.")
+
+
 class FindingRequest(BaseModel):
-    tenant_id: str = "default"
+    tenant_id: str
     source_system: str
     source_finding_id: str
     cve_id: str
     asset_id: str
     package_id: Optional[str] = None
-
     cvss_base: Optional[float] = None
     cvss_vector: Optional[str] = None
     description: Optional[str] = None
     business_service_id: Optional[str] = None
     internet_exposed: Optional[bool] = None
     first_detected_at: Optional[str] = None
-
     status: str = "VALID"
+
+
+@app.post("/findings")
+def create_finding(finding: FindingRequest):
+    """Idempotent - same source_system+source_finding_id+asset_id+package_id returns the same finding_id."""
+    try:
+        finding_id = audit_client.upsert_finding(FindingInstance(**finding.model_dump()))
+        logger.info(f"Upserted finding: id={finding_id} cve={finding.cve_id}")
+        return {"status": "ok", "finding_id": finding_id}
+    except Exception as e:
+        logger.error(f"Failed to upsert finding: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record finding.")
 
 
 class DeadLetterRequest(BaseModel):
@@ -98,13 +117,37 @@ class DeadLetterRequest(BaseModel):
     source_system: str
     batch_id: Optional[str] = None
     source_finding_id: Optional[str] = None
-    stage: str
+    stage: Literal["INGESTION", "VALIDATION"]
     error_code: str
     error_message: str
     raw_record: Optional[dict] = None
     status: str = "OPEN"
     retry_count: int = 0
 
+
+@app.post("/dead-letters")
+def create_dead_letter(entry: DeadLetterRequest):
+    try:
+        dl_id = audit_client.log_dead_letter(DeadLetter(**entry.model_dump()))
+        logger.info(f"Logged dead letter: id={dl_id} stage={entry.stage}")
+        return {"status": "ok", "dead_letter_id": dl_id}
+    except Exception as e:
+        logger.error(f"Failed to log dead letter: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record dead letter.")
+
+
+@app.get("/findings/{finding_id}/history")
+def get_finding_history(finding_id: str):
+    try:
+        return audit_client.get_finding_history(finding_id)
+    except Exception as e:
+        logger.error(f"Failed to fetch finding history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch finding history.")
+
+
+# ============================================================
+# ANAFA - Enrichment
+# ============================================================
 
 class EvidenceValueRequest(BaseModel):
     value: Optional[Any] = None
@@ -131,6 +174,17 @@ class EnrichmentRunRequest(BaseModel):
     status: str
 
 
+@app.post("/enrichment-runs")
+def create_enrichment_run(run: EnrichmentRunRequest):
+    try:
+        run_id = audit_client.log_enrichment_run(EnrichmentRun(**run.model_dump()))
+        logger.info(f"Logged enrichment run: id={run_id}")
+        return {"status": "ok", "enrichment_run_id": run_id}
+    except Exception as e:
+        logger.error(f"Failed to log enrichment run: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record enrichment run.")
+
+
 class FindingEvidenceRequest(BaseModel):
     finding_instance_id: str
     source_finding_id: str
@@ -141,11 +195,9 @@ class FindingEvidenceRequest(BaseModel):
     schema_version: str
     adapter_name: str
     adapter_version: str
-
     cve_id: str
     asset_id: str
     cvss_base: Optional[float] = None
-
     epss_probability: EvidenceValueRequest
     epss_percentile: EvidenceValueRequest
     kev_status: EvidenceValueRequest
@@ -156,143 +208,8 @@ class FindingEvidenceRequest(BaseModel):
     compensating_controls: EvidenceValueRequest
 
 
-class KevCatalogueRequest(BaseModel):
-    source_timestamp: Optional[str] = None
-    catalogue_sha256: str
-    record_count: int
-    status: str
-
-
-class KevCatalogueEntryRequest(BaseModel):
-    catalogue_id: str
-    cve_id: str
-
-
-class KevCatalogueEntriesRequest(BaseModel):
-    entries: list[KevCatalogueEntryRequest]
-
-
-class AuditEventRequest(BaseModel):
-    actor_type: ActorType
-    actor_id: str
-    action: str
-    entity_type: str
-    entity_id: str
-    correlation_id: str
-    tenant_id: str = "default"
-    policy_version: Optional[str] = None
-    evidence_ref: Optional[str] = None
-    before_state: Optional[dict] = None
-    after_state: Optional[dict] = None
-
-
-# ============================================================
-# Health check
-# ============================================================
-
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "vpap-audit-api"}
-
-
-# ============================================================
-# finding_instance - Muizz (ingestion/validation)
-# 3-table spec is confirmed and schema.sql is updated to match.
-# ============================================================
-
-@app.post("/ingestion-batches")
-def create_ingestion_batch(batch: IngestionBatchRequest):
-    try:
-        db_batch = IngestionBatch(**batch.model_dump())
-        batch_id = audit_client.create_ingestion_batch(db_batch)
-
-        logger.info(f"Created ingestion batch: id={batch_id}")
-
-        return {
-            "status": "ok",
-            "batch_id": batch_id,
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to create ingestion batch: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to record ingestion batch.",
-        )
-
-
-@app.post("/findings")
-def create_finding(finding: FindingRequest):
-    try:
-        db_finding = FindingInstance(**finding.model_dump())
-        finding_id = audit_client.upsert_finding(db_finding)
-
-        logger.info(
-            f"Upserted finding: id={finding_id} "
-            f"cve={finding.cve_id}"
-        )
-
-        return {
-            "status": "ok",
-            "finding_id": finding_id,
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to upsert finding: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to record finding.",
-        )
-
-
-@app.post("/dead-letters")
-def create_dead_letter(dead_letter: DeadLetterRequest):
-    try:
-        db_dead_letter = DeadLetter(**dead_letter.model_dump())
-        dead_letter_id = audit_client.create_dead_letter(db_dead_letter)
-
-        logger.info(
-            f"Created dead letter: id={dead_letter_id} "
-            f"stage={dead_letter.stage}"
-        )
-
-        return {
-            "status": "ok",
-            "dead_letter_id": dead_letter_id,
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to create dead letter: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to record dead letter.",
-        )
-        
-# ============================================================
-# Enrichment tables - Anafa
-# ============================================================
-
-@app.post("/enrichment-runs")
-def create_enrichment_run(run: EnrichmentRunRequest):
-    """Start/record one enrichment batch run. Returns enrichment_run_id to reuse across the batch."""
-    try:
-        db_run = EnrichmentRun(**run.model_dump())
-        run_id = audit_client.log_enrichment_run(db_run)
-        logger.info(f"Logged enrichment run: id={run_id} adapter={run.adapter_name}")
-        return {"status": "ok", "enrichment_run_id": run_id}
-    except Exception as e:
-        logger.error(f"Failed to log enrichment run: {e}")
-        raise HTTPException(status_code=500, detail="Failed to record enrichment run.")
-
-
 @app.post("/evidence")
 def create_finding_evidence(evidence: FindingEvidenceRequest):
-    """
-    Record the complete evidence for one finding (EPSS, KEV, exposure,
-    runtime applicability, attack path, business criticality,
-    compensating controls) - each as a full EvidenceValue with
-    value/status/reason_code/provenance, never a bare value.
-    """
     try:
         db_evidence = DBFindingEvidence(
             **evidence.model_dump(exclude={
@@ -310,32 +227,45 @@ def create_finding_evidence(evidence: FindingEvidenceRequest):
             compensating_controls=EvidenceValue(**evidence.compensating_controls.model_dump()),
         )
         evidence_id = audit_client.log_finding_evidence(db_evidence)
-        logger.info(f"Logged finding evidence: id={evidence_id} finding_instance_id={evidence.finding_instance_id}")
+        logger.info(f"Logged finding evidence: id={evidence_id}")
         return {"status": "ok", "evidence_snapshot_id": evidence_id}
     except Exception as e:
         logger.error(f"Failed to log finding evidence: {e}")
         raise HTTPException(status_code=500, detail="Failed to record finding evidence.")
 
 
+class KevCatalogueRequest(BaseModel):
+    source_timestamp: Optional[str] = None
+    catalogue_sha256: str
+    record_count: int
+    status: str
+
+
 @app.post("/kev-catalogue")
 def create_kev_catalogue(catalogue: KevCatalogueRequest):
-    """Record one downloaded KEV catalogue snapshot. Returns catalogue_id to attach entries to."""
     try:
-        db_catalogue = KevCatalogue(**catalogue.model_dump())
-        catalogue_id = audit_client.log_kev_catalogue(db_catalogue)
-        logger.info(f"Logged KEV catalogue: id={catalogue_id} record_count={catalogue.record_count}")
+        catalogue_id = audit_client.log_kev_catalogue(KevCatalogue(**catalogue.model_dump()))
+        logger.info(f"Logged KEV catalogue: id={catalogue_id}")
         return {"status": "ok", "catalogue_id": catalogue_id}
     except Exception as e:
         logger.error(f"Failed to log KEV catalogue: {e}")
         raise HTTPException(status_code=500, detail="Failed to record KEV catalogue.")
 
 
+class KevCatalogueEntryRequest(BaseModel):
+    catalogue_id: str
+    cve_id: str
+
+
+class KevCatalogueEntriesRequest(BaseModel):
+    entries: list[KevCatalogueEntryRequest]
+
+
 @app.post("/kev-catalogue-entries")
 def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest):
-    """Bulk-insert the CVEs listed in a KEV catalogue snapshot. Duplicates are silently skipped."""
     try:
-        db_entries = [KevCatalogueEntry(**e.model_dump()) for e in request.entries]
-        count = audit_client.log_kev_catalogue_entries(db_entries)
+        entries = [KevCatalogueEntry(**e.model_dump()) for e in request.entries]
+        count = audit_client.log_kev_catalogue_entries(entries)
         logger.info(f"Logged {count} KEV catalogue entries")
         return {"status": "ok", "entries_inserted": count}
     except Exception as e:
@@ -344,30 +274,180 @@ def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest):
 
 
 # ============================================================
-# priority_decision - Vignesh (policy engine)
-# PENDING: table dropped, endpoint removed until his output
-# format is confirmed against the design doc's Decision spec
-# (see earlier discussion re: vps_score vs vps mismatch).
+# VIGNESH - Policy Engine
 # ============================================================
+
+class PolicyVersionRequest(BaseModel):
+    version_id: str
+    name: str
+    description: Optional[str] = None
+    author: str
+    thresholds_json: dict
+    weights_json: dict
+    sla_json: dict
+    conservative_floor_default: Priority = "P0"
+    artifact_digest: str
+    is_active: bool = True
+
+
+@app.post("/policy-versions")
+def create_policy_version(policy: PolicyVersionRequest):
+    try:
+        version_id = audit_client.log_policy_version(PolicyVersion(**policy.model_dump()))
+        logger.info(f"Logged policy version: id={version_id}")
+        return {"status": "ok", "version_id": version_id}
+    except Exception as e:
+        logger.error(f"Failed to log policy version: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record policy version.")
+
+
+class DecisionRequest(BaseModel):
+    tenant_id: str
+    finding_id: str
+    evidence_snapshot_id: str
+    policy_version: str
+    mandatory_remediation: bool
+    vps: Optional[float] = None
+    operational_priority: Priority
+    ssvc_outcome: Optional[Literal["TRACK", "TRACK*", "ATTEND", "ACT"]] = None
+    confidence: Literal["HIGH", "MEDIUM", "LOW"]
+    decision_status: Literal["FINAL", "PROVISIONAL", "NEEDS_REVIEW", "QUARANTINED"]
+    conservative_floor: Optional[Priority] = None
+    sla_hours: Optional[float] = None
+    sla_due_at: Optional[str] = None
+    rules_applied: list = []
+    evidence_refs: list = []
+
+
+@app.post("/decisions")
+def create_decision(decision: DecisionRequest):
+    """Versioned - never mutated. An override creates a NEW row."""
+    try:
+        decision_id = audit_client.log_decision(PriorityDecision(**decision.model_dump()))
+        logger.info(f"Logged decision: id={decision_id} priority={decision.operational_priority}")
+        return {"status": "ok", "priority_decision_id": decision_id}
+    except Exception as e:
+        logger.error(f"Failed to log decision: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record decision.")
+
+
+class HumanDecisionRequest(BaseModel):
+    tenant_id: str
+    finding_instance_id: str
+    request_id: str
+    decision_type: str
+    original_priority: Priority
+    proposed_priority: Priority
+    actor_id: str
+    actor_username: str
+    actor_role: Literal["ANALYST", "VULN_LEAD", "RISK_OWNER", "CISO_DELEGATE", "AUDITOR"]
+    rationale: str
+    signatures_json: list
+
+
+@app.post("/human-decisions")
+def create_human_decision(decision: HumanDecisionRequest):
+    try:
+        decision_id = audit_client.log_human_decision(HumanDecision(**decision.model_dump()))
+        logger.info(f"Logged human decision: id={decision_id}")
+        return {"status": "ok", "human_decision_id": decision_id}
+    except Exception as e:
+        logger.error(f"Failed to log human decision: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record human decision.")
+
+
+class ExceptionRequest(BaseModel):
+    tenant_id: str
+    finding_id: str
+    requester: str
+    approver: Optional[str] = None
+    status: str = "PENDING"
+    justification: str
+    risk_level: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    valid_until: str
+
+
+@app.post("/exceptions")
+def create_exception(exception: ExceptionRequest):
+    try:
+        exception_id = audit_client.log_exception(ExceptionRecord(**exception.model_dump()))
+        logger.info(f"Logged exception: id={exception_id}")
+        return {"status": "ok", "exception_id": exception_id}
+    except Exception as e:
+        logger.error(f"Failed to log exception: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record exception.")
+
+
+class OutboxEventRequest(BaseModel):
+    tenant_id: str
+    event_type: str
+    aggregate_id: str
+    idempotency_key: str
+    payload: dict
+    status: str = "PENDING"
+    retry_count: int = 0
+    external_id: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+@app.post("/outbox-events")
+def create_outbox_event(event: OutboxEventRequest):
+    try:
+        event_id = audit_client.log_outbox_event(OutboxEvent(**event.model_dump()))
+        logger.info(f"Logged outbox event: id={event_id}")
+        return {"status": "ok", "outbox_event_id": event_id}
+    except Exception as e:
+        logger.error(f"Failed to log outbox event: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record outbox event.")
+
+
+class TicketLinkRequest(BaseModel):
+    tenant_id: str
+    finding_instance_id: str
+    system: Literal["JIRA", "SERVICENOW", "HYBRID"]
+    ticket_key: str
+    ticket_url: Optional[str] = None
+    status: str = "OPEN"
+    priority: Optional[str] = None
+    sla_due_at: Optional[str] = None
+    last_synced_at: Optional[str] = None
+
+
+@app.post("/ticket-links")
+def create_ticket_link(ticket: TicketLinkRequest):
+    try:
+        ticket_id = audit_client.log_ticket_link(TicketLink(**ticket.model_dump()))
+        logger.info(f"Logged ticket link: id={ticket_id}")
+        return {"status": "ok", "ticket_link_id": ticket_id}
+    except Exception as e:
+        logger.error(f"Failed to log ticket link: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record ticket link.")
 
 
 # ============================================================
-# human_decision / exception_record - HITL review
-# PENDING: tables dropped, endpoints removed until confirmed.
+# SOHAIL - Audit
 # ============================================================
 
+class AuditEventRequest(BaseModel):
+    actor_type: ActorType
+    actor_id: str
+    action: str
+    entity_type: str
+    entity_id: str
+    correlation_id: str
+    tenant_id: str = "default"
+    policy_version: Optional[str] = None
+    evidence_ref: Optional[str] = None
+    before_state: Optional[dict] = None
+    after_state: Optional[dict] = None
 
-# ============================================================
-# audit_event - everyone, the "what happened" trail
-# ============================================================
 
 @app.post("/audit-events")
 def create_audit_event(event: AuditEventRequest):
-    """Append one audit event. This is the immutable 'who did what when' record."""
     try:
         db_event = DBAuditEvent(**event.model_dump())
         audit_client.log(db_event)
-        logger.info(f"Logged audit event: actor={event.actor_id} action={event.action} correlation_id={event.correlation_id}")
+        logger.info(f"Logged audit event: actor={event.actor_id} action={event.action}")
         return {"status": "ok", "message": "Audit event recorded"}
     except Exception as e:
         logger.error(f"Failed to write audit event: {e}")
@@ -376,7 +456,6 @@ def create_audit_event(event: AuditEventRequest):
 
 @app.get("/audit-events/{correlation_id}")
 def get_audit_trail(correlation_id: str):
-    """Fetch the raw audit_event rows for one finding, in chronological order."""
     try:
         rows = audit_client.get_trail(correlation_id)
         return {"correlation_id": correlation_id, "event_count": len(rows), "events": rows}

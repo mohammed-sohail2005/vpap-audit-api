@@ -1,21 +1,18 @@
 """
 vpap_audit.audit_client
 ------------------------
-Shared database client for VPAP 4.1, aligned with the design doc's
-actual data model:
+Shared database client for VPAP 4.1, covering all confirmed tables:
 
-    finding_instance    - one row per unique finding
-    evidence_snapshot   - enrichment data, FK to finding_instance
-    priority_decision   - scoring output, FK to finding_instance + evidence_snapshot
-    human_decision       - review/override actions, FK to priority_decision
-    exception_record     - risk acceptance/false-positive/deferment, FK to finding_instance
-    audit_event          - append-only "who did what when" trail, references any of the above
+    Muizz (ingestion):    ingestion_batch, finding_instance, dead_letter
+    Anafa (enrichment):   enrichment_run, finding_evidence, kev_catalogue,
+                          kev_catalogue_entry
+    Vignesh (policy):     policy_version, priority_decision, human_decision,
+                          exception_record, outbox_event, ticket_link
+    Sohail (audit):       audit_event (append-only, cross-cutting)
 
-Every pipeline stage (ingestion, enrichment, policy engine, HITL review)
-imports this ONE module. Import it directly if you're calling it from
-within the same Python process; otherwise call the equivalent endpoint
-on audit_api.py, which wraps every method here behind HTTP so nobody
-needs direct database credentials.
+Every pipeline stage imports this ONE module, or calls the equivalent
+endpoint on audit_api.py (which wraps every method here behind HTTP so
+nobody needs direct database credentials).
 """
 
 from __future__ import annotations
@@ -23,30 +20,34 @@ from __future__ import annotations
 import os
 import hashlib
 import json
-from typing import Optional, Literal
+from typing import Optional, Literal, Generic, TypeVar, Any
+from datetime import datetime
 from pydantic import BaseModel
 import psycopg
 from psycopg.types.json import Json
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env in the current folder and loads it into os.environ
-
+load_dotenv()
 
 ActorType = Literal["system", "human", "llm"]
 Priority = Literal["P0", "P1", "P2", "P3", "REVIEW"]
 EvidenceStatus = Literal["KNOWN", "UNKNOWN", "STALE", "ERROR"]
 
+T = TypeVar("T")
+
 
 # ============================================================
-# Models - one per table
+# MUIZZ - Ingestion & Validation
 # ============================================================
 
 class IngestionBatch(BaseModel):
     tenant_id: str
     source_system: str
-    source_type: str
+    source_type: Literal["FILE", "API", "STREAM"]
     source_reference: Optional[str] = None
     source_file_name: Optional[str] = None
+    processing_started_at: Optional[str] = None
+    processing_completed_at: Optional[str] = None
     total_records: int = 0
     accepted_records: int = 0
     rejected_records: int = 0
@@ -55,12 +56,32 @@ class IngestionBatch(BaseModel):
     error_message: Optional[str] = None
 
 
+class FindingInstance(BaseModel):
+    tenant_id: str
+    source_system: str
+    source_finding_id: str
+    cve_id: str
+    asset_id: str
+    package_id: Optional[str] = None
+    cvss_base: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    description: Optional[str] = None
+    business_service_id: Optional[str] = None
+    internet_exposed: Optional[bool] = None
+    first_detected_at: Optional[str] = None
+    status: str = "VALID"
+
+    def idempotency_key(self) -> str:
+        material = "|".join([self.source_system, self.source_finding_id, self.asset_id, self.package_id or "-"])
+        return hashlib.sha256(material.encode()).hexdigest()
+
+
 class DeadLetter(BaseModel):
     tenant_id: str
     source_system: str
     batch_id: Optional[str] = None
     source_finding_id: Optional[str] = None
-    stage: str
+    stage: Literal["INGESTION", "VALIDATION"]
     error_code: str
     error_message: str
     raw_record: Optional[dict] = None
@@ -68,45 +89,11 @@ class DeadLetter(BaseModel):
     retry_count: int = 0
 
 
-class FindingInstance(BaseModel):
-    tenant_id: str = "default"
-    source_system: str
-    source_finding_id: str
-    cve_id: str
-    asset_id: str
-    package_id: Optional[str] = None
-
-    cvss_base: Optional[float] = None
-    cvss_vector: Optional[str] = None
-    description: Optional[str] = None
-    business_service_id: Optional[str] = None
-    internet_exposed: Optional[bool] = None
-    first_detected_at: Optional[str] = None
-
-    status: str = "VALID"
-
-    def idempotency_key(self) -> str:
-        material = "|".join([
-            self.source_system,
-            self.source_finding_id,
-            self.asset_id,
-            self.package_id or "-",
-        ])
-        return hashlib.sha256(material.encode()).hexdigest()
-
-
 # ============================================================
-# Enrichment models (Anafa) - mirror her Pydantic contract exactly
+# ANAFA - Enrichment
 # ============================================================
-
-from typing import Generic, TypeVar, Any
-from datetime import datetime
-
-T = TypeVar("T")
-
 
 class EvidenceValue(BaseModel, Generic[T]):
-    """One piece of evidence and its provenance. UNKNOWN != False/0."""
     value: Optional[T] = None
     raw_value: Optional[Any] = None
     mapping_version: Optional[str] = None
@@ -141,7 +128,6 @@ class EnrichmentRun(BaseModel):
 
 
 class FindingEvidence(BaseModel):
-    """Complete evidence record for one vulnerability finding."""
     finding_instance_id: str
     source_finding_id: str
     tenant_id: str = "default"
@@ -151,7 +137,6 @@ class FindingEvidence(BaseModel):
     schema_version: str
     adapter_name: str
     adapter_version: str
-    evidence_snapshot_sha256: str
 
     cve_id: str
     asset_id: str
@@ -179,33 +164,93 @@ class KevCatalogueEntry(BaseModel):
     cve_id: str
 
 
+# ============================================================
+# VIGNESH - Policy Engine
+# ============================================================
+
+class PolicyVersion(BaseModel):
+    version_id: str
+    name: str
+    description: Optional[str] = None
+    author: str
+    thresholds_json: dict
+    weights_json: dict
+    sla_json: dict
+    conservative_floor_default: Priority = "P0"
+    artifact_digest: str
+    is_active: bool = True
+
+
 class PriorityDecision(BaseModel):
+    tenant_id: str
     finding_id: str
-    evidence_snapshot_id: Optional[str] = None
+    evidence_snapshot_id: str
     policy_version: str
-    mandatory_remediation: bool = False
+    mandatory_remediation: bool
     vps: Optional[float] = None
     operational_priority: Priority
-    confidence: str
-    decision_status: str  # 'FINAL' | 'NEEDS_REVIEW'
-    rules_applied: list[str]
-    evidence_refs: list[str]
+    ssvc_outcome: Optional[Literal["TRACK", "TRACK*", "ATTEND", "ACT"]] = None
+    confidence: Literal["HIGH", "MEDIUM", "LOW"]
+    decision_status: Literal["FINAL", "PROVISIONAL", "NEEDS_REVIEW", "QUARANTINED"]
+    conservative_floor: Optional[Priority] = None
+    sla_hours: Optional[float] = None
+    sla_due_at: Optional[str] = None
+    rules_applied: list = []
+    evidence_refs: list = []
 
 
 class HumanDecision(BaseModel):
-    priority_decision_id: str
+    tenant_id: str
+    finding_instance_id: str
+    request_id: str
+    decision_type: str
+    original_priority: Priority
+    proposed_priority: Priority
     actor_id: str
-    decision: str  # 'APPROVED' | 'OVERRIDDEN' | 'REJECTED'
-    reason: Optional[str] = None
+    actor_username: str
+    actor_role: Literal["ANALYST", "VULN_LEAD", "RISK_OWNER", "CISO_DELEGATE", "AUDITOR"]
+    rationale: str
+    signatures_json: list
 
 
 class ExceptionRecord(BaseModel):
+    tenant_id: str
     finding_id: str
-    actor_id: str
-    reason: str
-    exception_type: str  # 'RISK_ACCEPTED' | 'FALSE_POSITIVE' | 'DEFERRED'
-    revalidate_at: Optional[str] = None
+    requester: str
+    approver: Optional[str] = None
+    status: str = "PENDING"
+    justification: str
+    risk_level: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    valid_until: str
 
+
+class OutboxEvent(BaseModel):
+    tenant_id: str
+    event_type: str
+    aggregate_id: str
+    idempotency_key: str
+    payload: dict
+    status: str = "PENDING"
+    retry_count: int = 0
+    external_id: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class TicketLink(BaseModel):
+    tenant_id: str
+    finding_instance_id: str
+    system: Literal["JIRA", "SERVICENOW", "HYBRID"]
+    ticket_key: str
+    ticket_url: Optional[str] = None
+    status: str = "OPEN"
+    priority: Optional[str] = None
+    sla_due_at: Optional[str] = None
+    last_synced_at: Optional[str] = None
+
+
+# ============================================================
+# SOHAIL - Audit
+# ============================================================
 
 class AuditEvent(BaseModel):
     actor_type: ActorType
@@ -227,214 +272,76 @@ class AuditEvent(BaseModel):
 # ============================================================
 
 class AuditClient:
-    """
-    Thin wrapper around a Postgres connection, scoped to the VPAP schema.
-    Each service creates ONE AuditClient at startup and reuses it.
-    """
-
     def __init__(self, dsn: Optional[str] = None):
         self.dsn = dsn or os.environ["VPAP_AUDIT_DSN"]
 
     def _connect(self):
         return psycopg.connect(self.dsn)
 
-    # -------------------- finding_instance --------------------
+    def _insert_returning(self, table: str, columns: list[str], values: dict, returning: str) -> str:
+        placeholders = ", ".join(f"%({c})s" for c in columns)
+        col_list = ", ".join(columns)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) RETURNING {returning}",
+                    values,
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return str(row[0])
+
+    # -------------------- Muizz: ingestion_batch --------------------
+
+    def log_ingestion_batch(self, batch: IngestionBatch) -> str:
+        cols = list(IngestionBatch.model_fields.keys())
+        return self._insert_returning("public.ingestion_batch", cols, batch.model_dump(), "id")
+
+    # -------------------- Muizz: finding_instance --------------------
 
     def upsert_finding(self, finding: FindingInstance) -> str:
-        """
-        Insert a finding or return the existing row's id for the same
-        tenant + idempotency key.
-        """
         key = finding.idempotency_key()
-    
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO finding_instance
-                        (
-                            tenant_id,
-                            idempotency_key,
-                            source_system,
-                            source_finding_id,
-                            cve_id,
-                            asset_id,
-                            package_id,
-                            cvss_base,
-                            cvss_vector,
-                            description,
-                            business_service_id,
-                            internet_exposed,
-                            first_detected_at,
-                            status,
-                            first_seen_at,
-                            last_seen_at,
-                            created_at,
-                            updated_at
-                        )
+                    INSERT INTO public.finding_instance
+                        (tenant_id, idempotency_key, source_system, source_finding_id, cve_id,
+                         asset_id, package_id, cvss_base, cvss_vector, description,
+                         business_service_id, internet_exposed, first_detected_at, status,
+                         first_seen_at, last_seen_at)
                     VALUES
-                        (
-                            %(tenant_id)s,
-                            %(idempotency_key)s,
-                            %(source_system)s,
-                            %(source_finding_id)s,
-                            %(cve_id)s,
-                            %(asset_id)s,
-                            %(package_id)s,
-                            %(cvss_base)s,
-                            %(cvss_vector)s,
-                            %(description)s,
-                            %(business_service_id)s,
-                            %(internet_exposed)s,
-                            %(first_detected_at)s,
-                            %(status)s,
-                            now(),
-                            now(),
-                            now(),
-                            now()
-                        )
+                        (%(tenant_id)s, %(idempotency_key)s, %(source_system)s, %(source_finding_id)s,
+                         %(cve_id)s, %(asset_id)s, %(package_id)s, %(cvss_base)s, %(cvss_vector)s,
+                         %(description)s, %(business_service_id)s, %(internet_exposed)s,
+                         %(first_detected_at)s, %(status)s, now(), now())
                     ON CONFLICT (tenant_id, idempotency_key)
-                    DO UPDATE SET
-                        last_seen_at = now(),
-                        updated_at = now(),
-                        status = EXCLUDED.status
+                    DO UPDATE SET last_seen_at = now(), status = EXCLUDED.status, updated_at = now()
                     RETURNING id
                     """,
-                    {
-                        **finding.model_dump(),
-                        "idempotency_key": key,
-                    },
+                    {**finding.model_dump(), "idempotency_key": key},
                 )
-    
                 row = cur.fetchone()
-    
             conn.commit()
-    
         return str(row[0])
 
-    # -------------------- ingesion_batch --------------------
+    # -------------------- Muizz: dead_letter --------------------
 
-    def create_ingestion_batch(self, batch: IngestionBatch) -> str:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO ingestion_batch
-                        (
-                            tenant_id,
-                            source_system,
-                            source_type,
-                            source_reference,
-                            source_file_name,
-                            total_records,
-                            accepted_records,
-                            rejected_records,
-                            validation_failed_records,
-                            status,
-                            error_message
-                        )
-                    VALUES
-                        (
-                            %(tenant_id)s,
-                            %(source_system)s,
-                            %(source_type)s,
-                            %(source_reference)s,
-                            %(source_file_name)s,
-                            %(total_records)s,
-                            %(accepted_records)s,
-                            %(rejected_records)s,
-                            %(validation_failed_records)s,
-                            %(status)s,
-                            %(error_message)s
-                        )
-                    RETURNING id
-                    """,
-                    batch.model_dump(),
-                )
-    
-                row = cur.fetchone()
-    
-            conn.commit()
-    
-        return str(row[0])
+    def log_dead_letter(self, entry: DeadLetter) -> str:
+        payload = entry.model_dump(exclude={"raw_record"})
+        payload["raw_record"] = Json(entry.raw_record) if entry.raw_record else None
+        cols = list(DeadLetter.model_fields.keys())
+        return self._insert_returning("public.dead_letter", cols, payload, "id")
 
-    # -------------------- dead_letter -----------------------
-
-    def create_dead_letter(self, dead_letter: DeadLetter) -> str:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO dead_letter
-                        (
-                            tenant_id,
-                            source_system,
-                            batch_id,
-                            source_finding_id,
-                            stage,
-                            error_code,
-                            error_message,
-                            raw_record,
-                            status,
-                            retry_count
-                        )
-                    VALUES
-                        (
-                            %(tenant_id)s,
-                            %(source_system)s,
-                            %(batch_id)s,
-                            %(source_finding_id)s,
-                            %(stage)s,
-                            %(error_code)s,
-                            %(error_message)s,
-                            %(raw_record)s,
-                            %(status)s,
-                            %(retry_count)s
-                        )
-                    RETURNING id
-                    """,
-                    {
-                        **dead_letter.model_dump(exclude={"raw_record"}),
-                        "raw_record": (
-                            Json(dead_letter.raw_record)
-                            if dead_letter.raw_record is not None
-                            else None
-                        ),
-                    },
-                )
-    
-                row = cur.fetchone()
-    
-            conn.commit()
-    
-        return str(row[0])
-    
-    # -------------------- enrichment_run --------------------
+    # -------------------- Anafa: enrichment_run --------------------
 
     def log_enrichment_run(self, run: EnrichmentRun) -> str:
-        """Insert one enrichment_run row. Returns its enrichment_run_id."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO enrichment_run
-                        (tenant_id, source_system, source_instance_id, adapter_name,
-                         adapter_version, schema_version, started_at, completed_at, status)
-                    VALUES
-                        (%(tenant_id)s, %(source_system)s, %(source_instance_id)s, %(adapter_name)s,
-                         %(adapter_version)s, %(schema_version)s, %(started_at)s, %(completed_at)s, %(status)s)
-                    RETURNING enrichment_run_id
-                    """,
-                    run.model_dump(),
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        cols = list(EnrichmentRun.model_fields.keys())
+        return self._insert_returning("enrichment_run", cols, run.model_dump(), "enrichment_run_id")
 
-    # -------------------- finding_evidence --------------------
+    # -------------------- Anafa: finding_evidence --------------------
 
     def log_finding_evidence(self, evidence: FindingEvidence) -> str:
-        """Insert one finding_evidence row. Returns its evidence_snapshot_id."""
         evidence_fields = [
             "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
             "runtime_applicability", "attack_path_reachable", "business_criticality",
@@ -444,61 +351,28 @@ class AuditClient:
         for f in evidence_fields:
             payload[f] = Json(getattr(evidence, f).model_dump(mode="json"))
 
-        # evidence_snapshot_sha256 is computed from the full evidence payload,
-        # so it's tamper-evident - recompute here rather than trusting a
-        # caller-supplied hash.
         hashable = evidence.model_dump(mode="json")
-        computed_sha256 = hashlib.sha256(json.dumps(hashable, sort_keys=True).encode()).hexdigest()
-        payload["evidence_snapshot_sha256"] = computed_sha256
+        payload["evidence_snapshot_sha256"] = hashlib.sha256(
+            json.dumps(hashable, sort_keys=True).encode()
+        ).hexdigest()
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO finding_evidence
-                        (finding_instance_id, source_finding_id, tenant_id, source_system,
-                         source_instance_id, enrichment_run_id, schema_version, adapter_name,
-                         adapter_version, evidence_snapshot_sha256, cve_id, asset_id, cvss_base,
-                         epss_probability, epss_percentile, kev_status, internet_exposure,
-                         runtime_applicability, attack_path_reachable, business_criticality,
-                         compensating_controls)
-                    VALUES
-                        (%(finding_instance_id)s, %(source_finding_id)s, %(tenant_id)s, %(source_system)s,
-                         %(source_instance_id)s, %(enrichment_run_id)s, %(schema_version)s, %(adapter_name)s,
-                         %(adapter_version)s, %(evidence_snapshot_sha256)s, %(cve_id)s, %(asset_id)s, %(cvss_base)s,
-                         %(epss_probability)s, %(epss_percentile)s, %(kev_status)s, %(internet_exposure)s,
-                         %(runtime_applicability)s, %(attack_path_reachable)s, %(business_criticality)s,
-                         %(compensating_controls)s)
-                    RETURNING evidence_snapshot_id
-                    """,
-                    payload,
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        cols = [
+            "finding_instance_id", "source_finding_id", "tenant_id", "source_system",
+            "source_instance_id", "enrichment_run_id", "schema_version", "adapter_name",
+            "adapter_version", "evidence_snapshot_sha256", "cve_id", "asset_id", "cvss_base",
+            "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
+            "runtime_applicability", "attack_path_reachable", "business_criticality",
+            "compensating_controls",
+        ]
+        return self._insert_returning("finding_evidence", cols, payload, "evidence_snapshot_id")
 
-    # -------------------- kev_catalogue --------------------
+    # -------------------- Anafa: kev_catalogue --------------------
 
     def log_kev_catalogue(self, catalogue: KevCatalogue) -> str:
-        """Insert one kev_catalogue snapshot row. Returns its catalogue_id."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO kev_catalogue
-                        (source_timestamp, catalogue_sha256, record_count, status)
-                    VALUES
-                        (%(source_timestamp)s, %(catalogue_sha256)s, %(record_count)s, %(status)s)
-                    RETURNING catalogue_id
-                    """,
-                    catalogue.model_dump(),
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        cols = list(KevCatalogue.model_fields.keys())
+        return self._insert_returning("kev_catalogue", cols, catalogue.model_dump(), "catalogue_id")
 
     def log_kev_catalogue_entries(self, entries: list[KevCatalogueEntry]) -> int:
-        """Bulk-insert kev_catalogue_entry rows. Returns count inserted (duplicates skipped)."""
         if not entries:
             return 0
         with self._connect() as conn:
@@ -515,76 +389,56 @@ class AuditClient:
             conn.commit()
         return count
 
-    # -------------------- priority_decision --------------------
+    # -------------------- Vignesh: policy_version --------------------
+
+    def log_policy_version(self, policy: PolicyVersion) -> str:
+        payload = policy.model_dump(exclude={"thresholds_json", "weights_json", "sla_json"})
+        payload["thresholds_json"] = Json(policy.thresholds_json)
+        payload["weights_json"] = Json(policy.weights_json)
+        payload["sla_json"] = Json(policy.sla_json)
+        cols = list(PolicyVersion.model_fields.keys())
+        return self._insert_returning("public.policy_version", cols, payload, "version_id")
+
+    # -------------------- Vignesh: priority_decision --------------------
 
     def log_decision(self, decision: PriorityDecision) -> str:
-        """Insert one priority_decision row (versioned - never mutated). Returns its id."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO priority_decision
-                        (finding_id, evidence_snapshot_id, policy_version, mandatory_remediation,
-                         vps, operational_priority, confidence, decision_status,
-                         rules_applied, evidence_refs)
-                    VALUES
-                        (%(finding_id)s, %(evidence_snapshot_id)s, %(policy_version)s, %(mandatory_remediation)s,
-                         %(vps)s, %(operational_priority)s, %(confidence)s, %(decision_status)s,
-                         %(rules_applied)s, %(evidence_refs)s)
-                    RETURNING id
-                    """,
-                    {
-                        **decision.model_dump(exclude={"rules_applied", "evidence_refs"}),
-                        "rules_applied": Json(decision.rules_applied),
-                        "evidence_refs": Json(decision.evidence_refs),
-                    },
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        payload = decision.model_dump(exclude={"rules_applied", "evidence_refs"})
+        payload["rules_applied"] = Json(decision.rules_applied)
+        payload["evidence_refs"] = Json(decision.evidence_refs)
+        cols = list(PriorityDecision.model_fields.keys())
+        return self._insert_returning("public.priority_decision", cols, payload, "id")
 
-    # -------------------- human_decision --------------------
+    # -------------------- Vignesh: human_decision --------------------
 
     def log_human_decision(self, decision: HumanDecision) -> str:
-        """Insert one human_decision row, linked to a priority_decision. Returns its id."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO human_decision (priority_decision_id, actor_id, decision, reason)
-                    VALUES (%(priority_decision_id)s, %(actor_id)s, %(decision)s, %(reason)s)
-                    RETURNING id
-                    """,
-                    decision.model_dump(),
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        payload = decision.model_dump(exclude={"signatures_json"})
+        payload["signatures_json"] = Json(decision.signatures_json)
+        cols = list(HumanDecision.model_fields.keys())
+        return self._insert_returning("public.human_decision", cols, payload, "id")
 
-    # -------------------- exception_record --------------------
+    # -------------------- Vignesh: exception_record --------------------
 
     def log_exception(self, exception: ExceptionRecord) -> str:
-        """Insert one exception_record row. Returns its id."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO exception_record
-                        (finding_id, actor_id, reason, exception_type, revalidate_at)
-                    VALUES
-                        (%(finding_id)s, %(actor_id)s, %(reason)s, %(exception_type)s, %(revalidate_at)s)
-                    RETURNING id
-                    """,
-                    exception.model_dump(),
-                )
-                row = cur.fetchone()
-            conn.commit()
-        return str(row[0])
+        cols = list(ExceptionRecord.model_fields.keys())
+        return self._insert_returning("public.exception_record", cols, exception.model_dump(), "id")
 
-    # -------------------- audit_event --------------------
+    # -------------------- Vignesh: outbox_event --------------------
+
+    def log_outbox_event(self, event: OutboxEvent) -> str:
+        payload = event.model_dump(exclude={"payload"})
+        payload["payload"] = Json(event.payload)
+        cols = list(OutboxEvent.model_fields.keys())
+        return self._insert_returning("public.outbox_event", cols, payload, "id")
+
+    # -------------------- Vignesh: ticket_link --------------------
+
+    def log_ticket_link(self, ticket: TicketLink) -> str:
+        cols = list(TicketLink.model_fields.keys())
+        return self._insert_returning("public.ticket_link", cols, ticket.model_dump(), "id")
+
+    # -------------------- Sohail: audit_event --------------------
 
     def log(self, event: AuditEvent) -> None:
-        """Write one audit event. This table is append-only - INSERT only."""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -608,7 +462,6 @@ class AuditClient:
             conn.commit()
 
     def get_trail(self, correlation_id: str) -> list[dict]:
-        """Fetch the full ordered audit trail for one finding."""
         with self._connect() as conn:
             with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
                 cur.execute(
@@ -618,43 +471,47 @@ class AuditClient:
                 return cur.fetchall()
 
     def get_finding_history(self, finding_id: str) -> dict:
-        """
-        Fetch everything known about one finding: the finding itself,
-        all evidence snapshots, all priority decisions (with any human
-        decisions on each), and any exceptions - for reconstructing a
-        finding's complete story across the proper relational schema.
-        """
+        """Full reconstructed story of one finding across every team's tables."""
         with self._connect() as conn:
             with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-                cur.execute("SELECT * FROM finding_instance WHERE id = %(id)s", {"id": finding_id})
+                cur.execute("SELECT * FROM public.finding_instance WHERE id = %(id)s", {"id": finding_id})
                 finding = cur.fetchone()
 
                 cur.execute(
-                    "SELECT * FROM evidence_snapshot WHERE finding_id = %(id)s ORDER BY retrieved_at ASC",
+                    "SELECT * FROM finding_evidence WHERE finding_instance_id = %(id)s ORDER BY created_at ASC",
                     {"id": finding_id},
                 )
                 evidence = cur.fetchall()
 
                 cur.execute(
-                    "SELECT * FROM priority_decision WHERE finding_id = %(id)s ORDER BY created_at ASC",
+                    "SELECT * FROM public.priority_decision WHERE finding_id = %(id)s ORDER BY created_at ASC",
                     {"id": finding_id},
                 )
                 decisions = cur.fetchall()
 
-                decision_ids = [d["id"] for d in decisions]
-                human_decisions = []
-                if decision_ids:
-                    cur.execute(
-                        "SELECT * FROM human_decision WHERE priority_decision_id = ANY(%(ids)s) ORDER BY created_at ASC",
-                        {"ids": decision_ids},
-                    )
-                    human_decisions = cur.fetchall()
+                cur.execute(
+                    "SELECT * FROM public.human_decision WHERE finding_instance_id = %(id)s ORDER BY created_at ASC",
+                    {"id": finding_id},
+                )
+                human_decisions = cur.fetchall()
 
                 cur.execute(
-                    "SELECT * FROM exception_record WHERE finding_id = %(id)s ORDER BY created_at ASC",
+                    "SELECT * FROM public.exception_record WHERE finding_id = %(id)s ORDER BY created_at ASC",
                     {"id": finding_id},
                 )
                 exceptions = cur.fetchall()
+
+                cur.execute(
+                    "SELECT * FROM public.ticket_link WHERE finding_instance_id = %(id)s ORDER BY created_at ASC",
+                    {"id": finding_id},
+                )
+                tickets = cur.fetchall()
+
+                cur.execute(
+                    "SELECT * FROM audit_event WHERE correlation_id = %(id)s ORDER BY occurred_at ASC",
+                    {"id": finding_id},
+                )
+                audit_trail = cur.fetchall()
 
         return {
             "finding": finding,
@@ -662,4 +519,6 @@ class AuditClient:
             "decisions": decisions,
             "human_decisions": human_decisions,
             "exceptions": exceptions,
+            "tickets": tickets,
+            "audit_trail": audit_trail,
         }
