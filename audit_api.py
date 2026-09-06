@@ -174,7 +174,6 @@ class EnrichmentRunRequest(BaseModel):
     completed_at: Optional[str] = None
     status: str
 
-
 @app.post("/enrichment-runs")
 def create_enrichment_run(run: EnrichmentRunRequest):
     try:
@@ -184,6 +183,45 @@ def create_enrichment_run(run: EnrichmentRunRequest):
     except Exception as e:
         logger.error(f"Failed to log enrichment run: {e}")
         raise HTTPException(status_code=500, detail="Failed to record enrichment run.")
+
+
+class EnrichmentRunUpdateRequest(BaseModel):
+    status: Literal["COMPLETED", "FAILED"]
+    completed_at: str
+
+@app.patch("/enrichment-runs/{enrichment_run_id}")
+def update_enrichment_run(
+    enrichment_run_id: str,
+    update: EnrichmentRunUpdateRequest,
+):
+    try:
+        run_id = audit_client.update_enrichment_run(
+            enrichment_run_id=enrichment_run_id,
+            status=update.status,
+            completed_at=update.completed_at,
+        )
+
+        logger.info(
+            f"Updated enrichment run: id={run_id} "
+            f"status={update.status}"
+        )
+
+        return {
+            "status": "ok",
+            "enrichment_run_id": run_id,
+            "run_status": update.status,
+        }
+
+    except ValueError as e:
+        logger.error(f"Enrichment run not found: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+
+    except Exception as e:
+        logger.error(f"Failed to update enrichment run: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update enrichment run.",
+        )
 
 
 class FindingEvidenceRequest(BaseModel):
