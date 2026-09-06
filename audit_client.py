@@ -164,6 +164,18 @@ class KevCatalogueEntry(BaseModel):
     cve_id: str
 
 
+class EpssSnapshot(BaseModel):
+    source_timestamp: Optional[str] = None
+    record_count: int
+
+
+class EpssSnapshotEntry(BaseModel):
+    snapshot_id: str
+    cve_id: str
+    epss_probability: float
+    epss_percentile: float
+
+
 # ============================================================
 # VIGNESH - Policy Engine
 # ============================================================
@@ -388,6 +400,53 @@ class AuditClient:
                 count = cur.rowcount
             conn.commit()
         return count
+
+    # -------------------- Anafa: epss_snapshot --------------------
+
+    def log_epss_snapshot(self, snapshot: EpssSnapshot) -> str:
+        cols = list(EpssSnapshot.model_fields.keys())
+        return self._insert_returning("epss_snapshot", cols, snapshot.model_dump(), "snapshot_id")
+
+    def log_epss_snapshot_entries(self, entries: list[EpssSnapshotEntry]) -> int:
+        if not entries:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO epss_snapshot_entry (snapshot_id, cve_id, epss_probability, epss_percentile)
+                    VALUES (%(snapshot_id)s, %(cve_id)s, %(epss_probability)s, %(epss_percentile)s)
+                    ON CONFLICT (snapshot_id, cve_id) DO NOTHING
+                    """,
+                    [e.model_dump() for e in entries],
+                )
+                count = cur.rowcount
+            conn.commit()
+        return count
+
+    def get_latest_epss_values(self, cve_ids: list[str]) -> list[dict]:
+        """
+        Look up the most recent EPSS snapshot's values for the given CVEs,
+        so enrichment can reuse cached values instead of querying EPSS
+        for every finding. Returns one row per CVE found, from the
+        single most recent snapshot (not mixed across snapshots), plus
+        the snapshot's retrieved_at so the caller can judge freshness.
+        """
+        if not cve_ids:
+            return []
+        with self._connect() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT s.snapshot_id, s.retrieved_at, e.cve_id, e.epss_probability, e.epss_percentile
+                    FROM epss_snapshot s
+                    JOIN epss_snapshot_entry e ON e.snapshot_id = s.snapshot_id
+                    WHERE s.snapshot_id = (SELECT snapshot_id FROM epss_snapshot ORDER BY retrieved_at DESC LIMIT 1)
+                    AND e.cve_id = ANY(%(cve_ids)s)
+                    """,
+                    {"cve_ids": cve_ids},
+                )
+                return cur.fetchall()
 
     # -------------------- Vignesh: policy_version --------------------
 

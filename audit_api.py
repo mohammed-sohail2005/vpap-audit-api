@@ -28,6 +28,7 @@ from audit_client import (
     IngestionBatch, FindingInstance, DeadLetter,
     EvidenceValue, EnrichmentRun, FindingEvidence as DBFindingEvidence,
     KevCatalogue, KevCatalogueEntry,
+    EpssSnapshot, EpssSnapshotEntry,
     PolicyVersion, PriorityDecision, HumanDecision, ExceptionRecord,
     OutboxEvent, TicketLink,
     AuditEvent as DBAuditEvent,
@@ -271,6 +272,65 @@ def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest):
     except Exception as e:
         logger.error(f"Failed to log KEV catalogue entries: {e}")
         raise HTTPException(status_code=500, detail="Failed to record KEV catalogue entries.")
+
+
+class EpssSnapshotRequest(BaseModel):
+    source_timestamp: Optional[str] = None
+    record_count: int
+
+
+@app.post("/epss-snapshots")
+def create_epss_snapshot(snapshot: EpssSnapshotRequest):
+    """Record one EPSS bulk download/snapshot. Returns snapshot_id to attach entries to."""
+    try:
+        snapshot_id = audit_client.log_epss_snapshot(EpssSnapshot(**snapshot.model_dump()))
+        logger.info(f"Logged EPSS snapshot: id={snapshot_id} record_count={snapshot.record_count}")
+        return {"status": "ok", "snapshot_id": snapshot_id}
+    except Exception as e:
+        logger.error(f"Failed to log EPSS snapshot: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record EPSS snapshot.")
+
+
+class EpssSnapshotEntryRequest(BaseModel):
+    snapshot_id: str
+    cve_id: str
+    epss_probability: float
+    epss_percentile: float
+
+
+class EpssSnapshotEntriesRequest(BaseModel):
+    entries: list[EpssSnapshotEntryRequest]
+
+
+@app.post("/epss-snapshot-entries")
+def create_epss_snapshot_entries(request: EpssSnapshotEntriesRequest):
+    """Bulk-insert EPSS scores for a snapshot. Duplicates (same snapshot+CVE) are silently skipped."""
+    try:
+        entries = [EpssSnapshotEntry(**e.model_dump()) for e in request.entries]
+        count = audit_client.log_epss_snapshot_entries(entries)
+        logger.info(f"Logged {count} EPSS snapshot entries")
+        return {"status": "ok", "entries_inserted": count}
+    except Exception as e:
+        logger.error(f"Failed to log EPSS snapshot entries: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record EPSS snapshot entries.")
+
+
+@app.get("/epss-snapshot-entries/latest")
+def get_latest_epss_values(cve_ids: str):
+    """
+    Look up the latest EPSS values for a batch of CVEs, so enrichment
+    can reuse cached values instead of querying EPSS per finding.
+    cve_ids: comma-separated list, e.g. ?cve_ids=CVE-2026-1,CVE-2026-2
+    Returns each CVE found in the single most recent snapshot, along
+    with that snapshot's retrieved_at so the caller can judge freshness.
+    """
+    try:
+        cve_list = [c.strip() for c in cve_ids.split(",") if c.strip()]
+        rows = audit_client.get_latest_epss_values(cve_list)
+        return {"requested": cve_list, "found": len(rows), "values": rows}
+    except Exception as e:
+        logger.error(f"Failed to fetch latest EPSS values: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch latest EPSS values.")
 
 
 # ============================================================
