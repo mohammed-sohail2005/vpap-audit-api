@@ -353,6 +353,40 @@ class AuditClient:
 
     # -------------------- Anafa: finding_evidence --------------------
 
+    def update_enrichment_run(self, enrichment_run_id: str, status: str, completed_at: Optional[str] = None,) -> str:
+        """
+        Update the lifecycle status of an existing enrichment run.
+
+        Used by the enrichment pipeline to transition a run from
+        RUNNING to COMPLETED or FAILED.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE enrichment_run
+                    SET status = %(status)s,
+                        completed_at = %(completed_at)s
+                    WHERE enrichment_run_id = %(enrichment_run_id)s
+                    RETURNING enrichment_run_id
+                    """,
+                    {
+                        "enrichment_run_id": enrichment_run_id,
+                        "status": status,
+                        "completed_at": completed_at,
+                    },
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if not row:
+            raise ValueError(
+                f"Enrichment run not found: {enrichment_run_id}"
+            )
+
+        return str(row[0])
+
+        
     def log_finding_evidence(self, evidence: FindingEvidence) -> str:
         evidence_fields = [
             "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
