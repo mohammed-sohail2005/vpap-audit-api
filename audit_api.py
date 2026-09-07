@@ -1,13 +1,26 @@
 """
-VPAP 4.1 - Full data & audit API
-------------------------------------
+VPAP 4.1 - Full data & audit API, with authentication
+--------------------------------------------------------
 One REST endpoint per table, so Muizz, Anafa, Vignesh, and I never need
 direct database credentials. Everyone calls this API; this service is
 the only thing holding the real Supabase connection string.
 
+AUTHENTICATION (added per team decision - see auth.py for full detail):
+Every endpoint below (except health check and token issuance itself)
+requires a Bearer token: `Authorization: Bearer <token>`. The token is
+obtained ONCE via POST /auth/token and reused for the rest of a session
+- no repeated authentication per call. Each token carries tenant_id and
+scope claims; the API validates the signature, expiry, and that the
+token's tenant_id matches the tenant being written to in the request
+body (defense in depth - a leaked token can't be reused for another
+tenant's data).
+
+    Auth:                POST /auth/token
     Muizz (ingestion):   POST /ingestion-batches, POST /findings, POST /dead-letters
     Anafa (enrichment):  POST /enrichment-runs, POST /evidence,
-                         POST /kev-catalogue, POST /kev-catalogue-entries
+                         POST /kev-catalogue, POST /kev-catalogue-entries,
+                         POST /epss-snapshots, POST /epss-snapshot-entries,
+                         GET /epss-snapshot-entries/latest
     Vignesh (policy):    POST /policy-versions, POST /decisions,
                          POST /human-decisions, POST /exceptions,
                          POST /outbox-events, POST /ticket-links
@@ -19,9 +32,11 @@ Run locally with:
 """
 
 from typing import Optional, Literal, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 import logging
+
+from auth import issue_token, require_auth, require_tenant_match, AuthContext
 
 from audit_client import (
     AuditClient,
@@ -39,8 +54,8 @@ logger = logging.getLogger("vpap-audit-api")
 
 app = FastAPI(
     title="VPAP Audit & Data API",
-    description="Shared endpoints for ingestion, enrichment, policy engine, and audit data.",
-    version="3.0.0",
+    description="Shared, authenticated endpoints for ingestion, enrichment, policy engine, and audit data.",
+    version="4.0.0",
 )
 
 audit_client = AuditClient()
@@ -51,7 +66,39 @@ Priority = Literal["P0", "P1", "P2", "P3", "REVIEW"]
 
 @app.get("/")
 def health_check():
+    """Public - no auth required, used to confirm the service is up."""
     return {"status": "ok", "service": "vpap-audit-api"}
+
+
+# ============================================================
+# AUTHENTICATION - mock IdP token issuance
+#
+# NOT part of the real production flow - stands in for a real IdP
+# (Auth0/Okta/etc) during this POC phase. Called ONCE at the start
+# of a session; the returned access_token is then reused for every
+# subsequent call for the rest of that session's lifetime.
+# ============================================================
+
+class TokenRequest(BaseModel):
+    tenant_id: str
+    scope: str = "persistence:*"   # POC default: full read/write access
+    subject: str                    # which service is requesting it, e.g. "enrichment-service"
+
+
+@app.post("/auth/token")
+def create_token(request: TokenRequest):
+    """
+    Mock token issuance (see auth.py for full explanation). A real IdP
+    would verify client credentials before issuing a token - omitted
+    here since this endpoint itself is standing in for that real IdP.
+    """
+    token_response = issue_token(
+        tenant_id=request.tenant_id,
+        scope=request.scope,
+        subject=request.subject,
+    )
+    logger.info(f"Issued token: subject={request.subject} tenant={request.tenant_id} scope={request.scope}")
+    return token_response
 
 
 # ============================================================
@@ -75,10 +122,13 @@ class IngestionBatchRequest(BaseModel):
 
 
 @app.post("/ingestion-batches")
-def create_ingestion_batch(batch: IngestionBatchRequest):
+def create_ingestion_batch(batch: IngestionBatchRequest, auth: AuthContext = Depends(require_auth)):
+    # Defense-in-depth: token's tenant must match the tenant this
+    # request is writing data for - see auth.py: require_tenant_match().
+    require_tenant_match(auth, batch.tenant_id)
     try:
         batch_id = audit_client.log_ingestion_batch(IngestionBatch(**batch.model_dump()))
-        logger.info(f"Logged ingestion batch: id={batch_id}")
+        logger.info(f"Logged ingestion batch: id={batch_id} tenant={auth.tenant_id} by={auth.subject}")
         return {"status": "ok", "batch_id": batch_id}
     except Exception as e:
         logger.error(f"Failed to log ingestion batch: {e}")
@@ -102,11 +152,12 @@ class FindingRequest(BaseModel):
 
 
 @app.post("/findings")
-def create_finding(finding: FindingRequest):
+def create_finding(finding: FindingRequest, auth: AuthContext = Depends(require_auth)):
     """Idempotent - same source_system+source_finding_id+asset_id+package_id returns the same finding_id."""
+    require_tenant_match(auth, finding.tenant_id)
     try:
         finding_id = audit_client.upsert_finding(FindingInstance(**finding.model_dump()))
-        logger.info(f"Upserted finding: id={finding_id} cve={finding.cve_id}")
+        logger.info(f"Upserted finding: id={finding_id} cve={finding.cve_id} by={auth.subject}")
         return {"status": "ok", "finding_id": finding_id}
     except Exception as e:
         logger.error(f"Failed to upsert finding: {e}")
@@ -127,10 +178,11 @@ class DeadLetterRequest(BaseModel):
 
 
 @app.post("/dead-letters")
-def create_dead_letter(entry: DeadLetterRequest):
+def create_dead_letter(entry: DeadLetterRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, entry.tenant_id)
     try:
         dl_id = audit_client.log_dead_letter(DeadLetter(**entry.model_dump()))
-        logger.info(f"Logged dead letter: id={dl_id} stage={entry.stage}")
+        logger.info(f"Logged dead letter: id={dl_id} stage={entry.stage} by={auth.subject}")
         return {"status": "ok", "dead_letter_id": dl_id}
     except Exception as e:
         logger.error(f"Failed to log dead letter: {e}")
@@ -138,7 +190,8 @@ def create_dead_letter(entry: DeadLetterRequest):
 
 
 @app.get("/findings/{finding_id}/history")
-def get_finding_history(finding_id: str):
+def get_finding_history(finding_id: str, auth: AuthContext = Depends(require_auth)):
+    """Read-only - any authenticated caller can look up a finding's full history."""
     try:
         return audit_client.get_finding_history(finding_id)
     except Exception as e:
@@ -176,10 +229,11 @@ class EnrichmentRunRequest(BaseModel):
 
 
 @app.post("/enrichment-runs")
-def create_enrichment_run(run: EnrichmentRunRequest):
+def create_enrichment_run(run: EnrichmentRunRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, run.tenant_id)
     try:
         run_id = audit_client.log_enrichment_run(EnrichmentRun(**run.model_dump()))
-        logger.info(f"Logged enrichment run: id={run_id}")
+        logger.info(f"Logged enrichment run: id={run_id} by={auth.subject}")
         return {"status": "ok", "enrichment_run_id": run_id}
     except Exception as e:
         logger.error(f"Failed to log enrichment run: {e}")
@@ -210,7 +264,8 @@ class FindingEvidenceRequest(BaseModel):
 
 
 @app.post("/evidence")
-def create_finding_evidence(evidence: FindingEvidenceRequest):
+def create_finding_evidence(evidence: FindingEvidenceRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, evidence.tenant_id)
     try:
         db_evidence = DBFindingEvidence(
             **evidence.model_dump(exclude={
@@ -228,7 +283,7 @@ def create_finding_evidence(evidence: FindingEvidenceRequest):
             compensating_controls=EvidenceValue(**evidence.compensating_controls.model_dump()),
         )
         evidence_id = audit_client.log_finding_evidence(db_evidence)
-        logger.info(f"Logged finding evidence: id={evidence_id}")
+        logger.info(f"Logged finding evidence: id={evidence_id} by={auth.subject}")
         return {"status": "ok", "evidence_snapshot_id": evidence_id}
     except Exception as e:
         logger.error(f"Failed to log finding evidence: {e}")
@@ -243,10 +298,14 @@ class KevCatalogueRequest(BaseModel):
 
 
 @app.post("/kev-catalogue")
-def create_kev_catalogue(catalogue: KevCatalogueRequest):
+def create_kev_catalogue(catalogue: KevCatalogueRequest, auth: AuthContext = Depends(require_auth)):
+    # No tenant_id on this request: KEV catalogue is a tenant-agnostic,
+    # shared global feed (same CISA data for everyone) - authentication
+    # (a valid token) is still required, but there's no per-tenant match
+    # to enforce here.
     try:
         catalogue_id = audit_client.log_kev_catalogue(KevCatalogue(**catalogue.model_dump()))
-        logger.info(f"Logged KEV catalogue: id={catalogue_id}")
+        logger.info(f"Logged KEV catalogue: id={catalogue_id} by={auth.subject}")
         return {"status": "ok", "catalogue_id": catalogue_id}
     except Exception as e:
         logger.error(f"Failed to log KEV catalogue: {e}")
@@ -263,11 +322,11 @@ class KevCatalogueEntriesRequest(BaseModel):
 
 
 @app.post("/kev-catalogue-entries")
-def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest):
+def create_kev_catalogue_entries(request: KevCatalogueEntriesRequest, auth: AuthContext = Depends(require_auth)):
     try:
         entries = [KevCatalogueEntry(**e.model_dump()) for e in request.entries]
         count = audit_client.log_kev_catalogue_entries(entries)
-        logger.info(f"Logged {count} KEV catalogue entries")
+        logger.info(f"Logged {count} KEV catalogue entries by={auth.subject}")
         return {"status": "ok", "entries_inserted": count}
     except Exception as e:
         logger.error(f"Failed to log KEV catalogue entries: {e}")
@@ -280,11 +339,11 @@ class EpssSnapshotRequest(BaseModel):
 
 
 @app.post("/epss-snapshots")
-def create_epss_snapshot(snapshot: EpssSnapshotRequest):
-    """Record one EPSS bulk download/snapshot. Returns snapshot_id to attach entries to."""
+def create_epss_snapshot(snapshot: EpssSnapshotRequest, auth: AuthContext = Depends(require_auth)):
+    # Also tenant-agnostic (shared EPSS feed) - same reasoning as KEV catalogue above.
     try:
         snapshot_id = audit_client.log_epss_snapshot(EpssSnapshot(**snapshot.model_dump()))
-        logger.info(f"Logged EPSS snapshot: id={snapshot_id} record_count={snapshot.record_count}")
+        logger.info(f"Logged EPSS snapshot: id={snapshot_id} by={auth.subject}")
         return {"status": "ok", "snapshot_id": snapshot_id}
     except Exception as e:
         logger.error(f"Failed to log EPSS snapshot: {e}")
@@ -303,12 +362,11 @@ class EpssSnapshotEntriesRequest(BaseModel):
 
 
 @app.post("/epss-snapshot-entries")
-def create_epss_snapshot_entries(request: EpssSnapshotEntriesRequest):
-    """Bulk-insert EPSS scores for a snapshot. Duplicates (same snapshot+CVE) are silently skipped."""
+def create_epss_snapshot_entries(request: EpssSnapshotEntriesRequest, auth: AuthContext = Depends(require_auth)):
     try:
         entries = [EpssSnapshotEntry(**e.model_dump()) for e in request.entries]
         count = audit_client.log_epss_snapshot_entries(entries)
-        logger.info(f"Logged {count} EPSS snapshot entries")
+        logger.info(f"Logged {count} EPSS snapshot entries by={auth.subject}")
         return {"status": "ok", "entries_inserted": count}
     except Exception as e:
         logger.error(f"Failed to log EPSS snapshot entries: {e}")
@@ -316,14 +374,8 @@ def create_epss_snapshot_entries(request: EpssSnapshotEntriesRequest):
 
 
 @app.get("/epss-snapshot-entries/latest")
-def get_latest_epss_values(cve_ids: str):
-    """
-    Look up the latest EPSS values for a batch of CVEs, so enrichment
-    can reuse cached values instead of querying EPSS per finding.
-    cve_ids: comma-separated list, e.g. ?cve_ids=CVE-2026-1,CVE-2026-2
-    Returns each CVE found in the single most recent snapshot, along
-    with that snapshot's retrieved_at so the caller can judge freshness.
-    """
+def get_latest_epss_values(cve_ids: str, auth: AuthContext = Depends(require_auth)):
+    """cve_ids: comma-separated list, e.g. ?cve_ids=CVE-2026-1,CVE-2026-2"""
     try:
         cve_list = [c.strip() for c in cve_ids.split(",") if c.strip()]
         rows = audit_client.get_latest_epss_values(cve_list)
@@ -351,10 +403,11 @@ class PolicyVersionRequest(BaseModel):
 
 
 @app.post("/policy-versions")
-def create_policy_version(policy: PolicyVersionRequest):
+def create_policy_version(policy: PolicyVersionRequest, auth: AuthContext = Depends(require_auth)):
+    # Tenant-agnostic, same reasoning as KEV/EPSS above (one shared policy catalogue).
     try:
         version_id = audit_client.log_policy_version(PolicyVersion(**policy.model_dump()))
-        logger.info(f"Logged policy version: id={version_id}")
+        logger.info(f"Logged policy version: id={version_id} by={auth.subject}")
         return {"status": "ok", "version_id": version_id}
     except Exception as e:
         logger.error(f"Failed to log policy version: {e}")
@@ -380,11 +433,12 @@ class DecisionRequest(BaseModel):
 
 
 @app.post("/decisions")
-def create_decision(decision: DecisionRequest):
+def create_decision(decision: DecisionRequest, auth: AuthContext = Depends(require_auth)):
     """Versioned - never mutated. An override creates a NEW row."""
+    require_tenant_match(auth, decision.tenant_id)
     try:
         decision_id = audit_client.log_decision(PriorityDecision(**decision.model_dump()))
-        logger.info(f"Logged decision: id={decision_id} priority={decision.operational_priority}")
+        logger.info(f"Logged decision: id={decision_id} priority={decision.operational_priority} by={auth.subject}")
         return {"status": "ok", "priority_decision_id": decision_id}
     except Exception as e:
         logger.error(f"Failed to log decision: {e}")
@@ -406,10 +460,11 @@ class HumanDecisionRequest(BaseModel):
 
 
 @app.post("/human-decisions")
-def create_human_decision(decision: HumanDecisionRequest):
+def create_human_decision(decision: HumanDecisionRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, decision.tenant_id)
     try:
         decision_id = audit_client.log_human_decision(HumanDecision(**decision.model_dump()))
-        logger.info(f"Logged human decision: id={decision_id}")
+        logger.info(f"Logged human decision: id={decision_id} by={auth.subject}")
         return {"status": "ok", "human_decision_id": decision_id}
     except Exception as e:
         logger.error(f"Failed to log human decision: {e}")
@@ -428,10 +483,11 @@ class ExceptionRequest(BaseModel):
 
 
 @app.post("/exceptions")
-def create_exception(exception: ExceptionRequest):
+def create_exception(exception: ExceptionRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, exception.tenant_id)
     try:
         exception_id = audit_client.log_exception(ExceptionRecord(**exception.model_dump()))
-        logger.info(f"Logged exception: id={exception_id}")
+        logger.info(f"Logged exception: id={exception_id} by={auth.subject}")
         return {"status": "ok", "exception_id": exception_id}
     except Exception as e:
         logger.error(f"Failed to log exception: {e}")
@@ -451,10 +507,11 @@ class OutboxEventRequest(BaseModel):
 
 
 @app.post("/outbox-events")
-def create_outbox_event(event: OutboxEventRequest):
+def create_outbox_event(event: OutboxEventRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, event.tenant_id)
     try:
         event_id = audit_client.log_outbox_event(OutboxEvent(**event.model_dump()))
-        logger.info(f"Logged outbox event: id={event_id}")
+        logger.info(f"Logged outbox event: id={event_id} by={auth.subject}")
         return {"status": "ok", "outbox_event_id": event_id}
     except Exception as e:
         logger.error(f"Failed to log outbox event: {e}")
@@ -474,10 +531,11 @@ class TicketLinkRequest(BaseModel):
 
 
 @app.post("/ticket-links")
-def create_ticket_link(ticket: TicketLinkRequest):
+def create_ticket_link(ticket: TicketLinkRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, ticket.tenant_id)
     try:
         ticket_id = audit_client.log_ticket_link(TicketLink(**ticket.model_dump()))
-        logger.info(f"Logged ticket link: id={ticket_id}")
+        logger.info(f"Logged ticket link: id={ticket_id} by={auth.subject}")
         return {"status": "ok", "ticket_link_id": ticket_id}
     except Exception as e:
         logger.error(f"Failed to log ticket link: {e}")
@@ -503,11 +561,12 @@ class AuditEventRequest(BaseModel):
 
 
 @app.post("/audit-events")
-def create_audit_event(event: AuditEventRequest):
+def create_audit_event(event: AuditEventRequest, auth: AuthContext = Depends(require_auth)):
+    require_tenant_match(auth, event.tenant_id)
     try:
         db_event = DBAuditEvent(**event.model_dump())
         audit_client.log(db_event)
-        logger.info(f"Logged audit event: actor={event.actor_id} action={event.action}")
+        logger.info(f"Logged audit event: actor={event.actor_id} action={event.action} by={auth.subject}")
         return {"status": "ok", "message": "Audit event recorded"}
     except Exception as e:
         logger.error(f"Failed to write audit event: {e}")
@@ -515,7 +574,8 @@ def create_audit_event(event: AuditEventRequest):
 
 
 @app.get("/audit-events/{correlation_id}")
-def get_audit_trail(correlation_id: str):
+def get_audit_trail(correlation_id: str, auth: AuthContext = Depends(require_auth)):
+    """Read-only - any authenticated caller can look up a finding's audit trail."""
     try:
         rows = audit_client.get_trail(correlation_id)
         return {"correlation_id": correlation_id, "event_count": len(rows), "events": rows}
