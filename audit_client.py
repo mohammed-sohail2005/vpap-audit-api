@@ -288,7 +288,7 @@ class AuditClient:
         self.dsn = dsn or os.environ["VPAP_AUDIT_DSN"]
 
     def _connect(self):
-        return psycopg.connect(self.dsn)
+    return psycopg.connect(self.dsn, prepare_threshold=None)
 
     def _insert_returning(self, table: str, columns: list[str], values: dict, returning: str) -> str:
         placeholders = ", ".join(f"%({c})s" for c in columns)
