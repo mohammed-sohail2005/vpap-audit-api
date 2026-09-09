@@ -6,7 +6,7 @@
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- needed for gen_random_uuid()
-
+    
 
 -- ============================================================
 -- MUIZZ - Ingestion & Validation
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS public.ingestion_batch (
 CREATE TABLE IF NOT EXISTS public.finding_instance (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id TEXT NOT NULL,
+    batch_id UUID,
     idempotency_key TEXT NOT NULL,
     source_system TEXT NOT NULL,
     source_finding_id TEXT NOT NULL,
@@ -70,6 +71,10 @@ CREATE TABLE IF NOT EXISTS public.finding_instance (
         CHECK (cvss_base IS NULL OR (cvss_base >= 0 AND cvss_base <= 10)),
     CONSTRAINT finding_instance_source_system_check
         CHECK (source_system = UPPER(source_system))
+    CONSTRAINT finding_instance_batch_fk
+        FOREIGN KEY (batch_id)
+        REFERENCES public.ingestion_batch(id)
+        ON DELETE SET NULL,
 );
 
 -- 3. DEAD LETTER
@@ -103,6 +108,7 @@ CREATE TABLE IF NOT EXISTS public.dead_letter (
 
 CREATE INDEX IF NOT EXISTS idx_ingestion_batch_tenant_created ON public.ingestion_batch (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ingestion_batch_tenant_status ON public.ingestion_batch (tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_finding_instance_batch ON public.finding_instance (batch_id);
 CREATE INDEX IF NOT EXISTS idx_finding_instance_tenant_cve ON public.finding_instance (tenant_id, cve_id);
 CREATE INDEX IF NOT EXISTS idx_finding_instance_tenant_asset ON public.finding_instance (tenant_id, asset_id);
 CREATE INDEX IF NOT EXISTS idx_finding_instance_tenant_status ON public.finding_instance (tenant_id, status);
