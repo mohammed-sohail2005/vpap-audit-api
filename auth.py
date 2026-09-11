@@ -14,10 +14,19 @@ any work.
 This is a MOCK identity provider, not a real one - appropriate for this
 POC phase. In a real production deployment, VPAP_AUTH_SECRET would be
 replaced by a real IdP's public key (e.g. Auth0/Okta/Azure AD), and
-/auth/token below would not exist at all - tokens would come from that
-real IdP instead. Swapping to a real IdP later only requires changing
-how tokens are ISSUED; the VALIDATION logic here (checking signature,
-expiry, tenant, scope) stays the same either way.
+tokens would come from that real IdP instead. Swapping to a real IdP
+later only requires changing how tokens are ISSUED; the VALIDATION
+logic here (checking signature, expiry, issuer, audience, tenant, scope)
+stays the same either way.
+
+UPDATED PER HIDAYAT'S REQUIREMENT (see team discussion): token issuance
+is NO LONGER exposed over HTTP for services to self-issue by supplying
+their own tenant_id/subject. Tokens are now pre-issued out-of-band by
+a trusted operator (see generate_token.py) and handed to each service
+directly. This module's issue_token() function still exists and is
+used by that script - it's just no longer reachable via a public
+/auth/token endpoint. Production will later replace this entirely with
+a real token provider / workload identity / client-credentials flow.
 
 WHY A TOKEN, NOT JUST A TENANT_ID IN THE BODY:
 A JWT is cryptographically signed - the server can prove nobody tampered
@@ -46,6 +55,12 @@ from fastapi import Header, HTTPException
 AUTH_SECRET = os.environ.get("VPAP_AUTH_SECRET", "dev-only-mock-secret-change-me")
 AUTH_ALGORITHM = "HS256"
 
+# Issuer and audience claims - identify WHO issued this token and WHAT
+# it's meant to be used against. Added per Hidayat's requirement.
+# A real IdP would set ISSUER to something like "https://vpap.us.auth0.com/".
+TOKEN_ISSUER = os.environ.get("VPAP_TOKEN_ISSUER", "vpap-audit-api-poc")
+TOKEN_AUDIENCE = os.environ.get("VPAP_TOKEN_AUDIENCE", "vpap-persistence-api")
+
 # How long an issued token stays valid before it must be refreshed.
 # Per the team's requirement ("no repeated authentication at every step"),
 # this is set generously so one token can be reused across a whole
@@ -55,12 +70,17 @@ TOKEN_LIFETIME_SECONDS = 8 * 60 * 60  # 8 hours
 
 
 # ============================================================
-# Token issuance (the MOCK "IdP" side)
+# Token issuance (trusted-operator-only, NOT exposed over HTTP)
 # ============================================================
 
 def issue_token(tenant_id: str, scope: str, subject: str) -> dict:
     """
-    Issue a signed JWT carrying tenant_id and scope claims.
+    Issue a signed JWT carrying tenant_id, scope, issuer, and audience
+    claims.
+
+    NOT called from any public endpoint anymore - only from
+    generate_token.py, run locally by a trusted operator. Services
+    receive their token out-of-band and do not self-issue.
 
     tenant_id: which tenant this token is authorized to act as - every
                API request made with this token must match this tenant,
@@ -76,6 +96,8 @@ def issue_token(tenant_id: str, scope: str, subject: str) -> dict:
         "sub": subject,
         "tenant_id": tenant_id,
         "scope": scope,
+        "iss": TOKEN_ISSUER,
+        "aud": TOKEN_AUDIENCE,
         "iat": now,                              # issued-at
         "exp": now + TOKEN_LIFETIME_SECONDS,      # expiry - checked automatically by jwt.decode()
     }
@@ -129,7 +151,12 @@ def require_auth(authorization: Optional[str] = Header(None)) -> AuthContext:
       1. Header is present and well-formed
       2. Token signature is valid (proves it was issued by us, unaltered)
       3. Token is not expired (checked automatically by jwt.decode via 'exp')
-      4. Token has the required claims (tenant_id, scope)
+      4. Token issuer matches TOKEN_ISSUER (proves it came from our
+         issuance process, not forged/copied from somewhere else)
+      5. Token audience matches TOKEN_AUDIENCE (proves it was meant for
+         THIS API, not some other service that happens to share the
+         signing secret)
+      6. Token has the required claims (tenant_id, scope)
     Tenant-matching against the actual request body happens separately,
     in require_tenant_match() below, since that needs to see the request
     body which isn't available at this stage.
@@ -137,9 +164,19 @@ def require_auth(authorization: Optional[str] = Header(None)) -> AuthContext:
     token = _extract_bearer_token(authorization)
 
     try:
-        payload = jwt.decode(token, AUTH_SECRET, algorithms=[AUTH_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            AUTH_SECRET,
+            algorithms=[AUTH_ALGORITHM],
+            issuer=TOKEN_ISSUER,
+            audience=TOKEN_AUDIENCE,
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired. Please re-authenticate.")
+    except jwt.InvalidIssuerError:
+        raise HTTPException(status_code=401, detail="Token issuer is not recognized.")
+    except jwt.InvalidAudienceError:
+        raise HTTPException(status_code=401, detail="Token audience does not match this API.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid or tampered token.")
 
@@ -171,7 +208,14 @@ def require_tenant_match(auth: AuthContext, request_tenant_id: str) -> None:
 
 
 def require_scope(auth: AuthContext, required_scope: str) -> None:
-    """Checks the token's scope permits the requested action."""
+    """
+    Checks the token's scope permits the requested action.
+
+    NOTE: as of this version, no endpoint in audit_api.py actually calls
+    this function - it exists but is not enforced anywhere yet. Either
+    wire it into each write endpoint, or confirm with the team that
+    scope enforcement isn't required for this POC phase.
+    """
     if auth.scope != required_scope and auth.scope != "persistence:*":
         raise HTTPException(
             status_code=403,
