@@ -17,7 +17,7 @@ tenant's data).
 
     Auth:                POST /auth/token
     Muizz (ingestion):   POST /ingestion-batches, POST /findings, POST /dead-letters
-    Anafa (enrichment):  POST /enrichment-runs, POST /evidence,
+    Anafa (enrichment):  POST /enrichment-runs, PATCH /enrichment-runs/{id}, POST /evidence,
                          POST /kev-catalogue, POST /kev-catalogue-entries,
                          POST /epss-snapshots, POST /epss-snapshot-entries,
                          GET /epss-snapshot-entries/latest
@@ -241,6 +241,7 @@ def create_enrichment_run(run: EnrichmentRunRequest, auth: AuthContext = Depends
 
 
 class EnrichmentRunUpdateRequest(BaseModel):
+    tenant_id: str
     status: Literal["COMPLETED", "FAILED"]
     completed_at: str
 
@@ -248,7 +249,13 @@ class EnrichmentRunUpdateRequest(BaseModel):
 def update_enrichment_run(
     enrichment_run_id: str,
     update: EnrichmentRunUpdateRequest,
+    auth: AuthContext = Depends(require_auth),
 ):
+    # Defense-in-depth: same tenant check every other write endpoint
+    # applies - without this, any valid token (for ANY tenant) could
+    # update ANY enrichment run, since enrichment_run_id alone doesn't
+    # prove ownership.
+    require_tenant_match(auth, update.tenant_id)
     try:
         run_id = audit_client.update_enrichment_run(
             enrichment_run_id=enrichment_run_id,
@@ -258,7 +265,7 @@ def update_enrichment_run(
 
         logger.info(
             f"Updated enrichment run: id={run_id} "
-            f"status={update.status}"
+            f"status={update.status} by={auth.subject}"
         )
 
         return {
