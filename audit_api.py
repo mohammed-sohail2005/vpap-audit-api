@@ -137,6 +137,7 @@ def create_ingestion_batch(batch: IngestionBatchRequest, auth: AuthContext = Dep
 
 class FindingRequest(BaseModel):
     tenant_id: str
+    batch_id: Optional[str] = None
     source_system: str
     source_finding_id: str
     cve_id: str

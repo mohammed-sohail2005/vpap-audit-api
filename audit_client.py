@@ -58,6 +58,7 @@ class IngestionBatch(BaseModel):
 
 class FindingInstance(BaseModel):
     tenant_id: str
+    batch_id: Optional[str] = None
     source_system: str
     source_finding_id: str
     cve_id: str
@@ -328,28 +329,42 @@ class AuditClient:
 
     def upsert_finding(self, finding: FindingInstance) -> str:
         key = finding.idempotency_key()
+    
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO public.finding_instance
-                        (tenant_id, idempotency_key, source_system, source_finding_id, cve_id,
-                         asset_id, package_id, cvss_base, cvss_vector, description,
-                         business_service_id, internet_exposed, first_detected_at, status,
-                         first_seen_at, last_seen_at)
+                        (tenant_id, batch_id, idempotency_key, source_system,
+                         source_finding_id, cve_id, asset_id, package_id,
+                         cvss_base, cvss_vector, description,
+                         business_service_id, internet_exposed, first_detected_at,
+                         status, first_seen_at, last_seen_at)
                     VALUES
-                        (%(tenant_id)s, %(idempotency_key)s, %(source_system)s, %(source_finding_id)s,
-                         %(cve_id)s, %(asset_id)s, %(package_id)s, %(cvss_base)s, %(cvss_vector)s,
-                         %(description)s, %(business_service_id)s, %(internet_exposed)s,
+                        (%(tenant_id)s, %(batch_id)s, %(idempotency_key)s,
+                         %(source_system)s, %(source_finding_id)s, %(cve_id)s,
+                         %(asset_id)s, %(package_id)s, %(cvss_base)s,
+                         %(cvss_vector)s, %(description)s,
+                         %(business_service_id)s, %(internet_exposed)s,
                          %(first_detected_at)s, %(status)s, now(), now())
                     ON CONFLICT (tenant_id, idempotency_key)
-                    DO UPDATE SET last_seen_at = now(), status = EXCLUDED.status, updated_at = now()
+                    DO UPDATE SET
+                        batch_id = EXCLUDED.batch_id,
+                        last_seen_at = now(),
+                        status = EXCLUDED.status,
+                        updated_at = now()
                     RETURNING id
                     """,
-                    {**finding.model_dump(), "idempotency_key": key},
+                    {
+                        **finding.model_dump(),
+                        "idempotency_key": key,
+                    },
                 )
+    
                 row = cur.fetchone()
+    
             conn.commit()
+    
         return str(row[0])
 
     # -------------------- Muizz: dead_letter --------------------
