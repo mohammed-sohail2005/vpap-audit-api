@@ -277,6 +277,13 @@ class AuditEvent(BaseModel):
     before_state: Optional[dict] = None
     after_state: Optional[dict] = None
     source_ip: Optional[str] = None
+    # NOTE: entity_type is still plain `str` here. An EntityType Literal +
+    # ACTIONS_BY_ENTITY model_validator was built and deployed at one point
+    # to reject invalid entity_type/action combinations with a clean 422
+    # instead of a vague 500 - that logic is not present in this version.
+    # Recover it from git history (git log --all -S "ACTIONS_BY_ENTITY")
+    # rather than rebuilding from scratch, so the restored rules match
+    # what was actually agreed on before.
 
 
 # ============================================================
@@ -288,6 +295,14 @@ class AuditClient:
         self.dsn = dsn or os.environ["VPAP_AUDIT_DSN"]
 
     def _connect(self):
+        # prepare_threshold=None disables psycopg3's server-side
+        # prepared statements entirely. Required because Supabase's
+        # transaction-mode pooler (port 6543) shares physical
+        # connections across sessions - prepared statement names can
+        # collide when the pooler hands us a connection another
+        # session already prepared a statement on. This trades a
+        # small amount of per-query performance for correctness,
+        # which is the right tradeoff when using a transaction pooler.
         return psycopg.connect(self.dsn, prepare_threshold=None)
 
     def _insert_returning(self, table: str, columns: list[str], values: dict, returning: str) -> str:
@@ -351,14 +366,22 @@ class AuditClient:
         cols = list(EnrichmentRun.model_fields.keys())
         return self._insert_returning("enrichment_run", cols, run.model_dump(), "enrichment_run_id")
 
-    # -------------------- Anafa: finding_evidence --------------------
-
-    def update_enrichment_run(self, enrichment_run_id: str, status: str, completed_at: Optional[str] = None,) -> str:
+    def update_enrichment_run(self, enrichment_run_id: str, status: str, completed_at: Optional[str] = None) -> str:
         """
         Update the lifecycle status of an existing enrichment run.
 
         Used by the enrichment pipeline to transition a run from
         RUNNING to COMPLETED or FAILED.
+
+        NOTE: as of this version there is no HTTP endpoint in audit_api.py
+        exposing this method yet - callers using PersistenceClient over
+        HTTP cannot reach it until a matching route (e.g.
+        PATCH /enrichment-runs/{enrichment_run_id}) is added.
+
+        NOTE: cur.fetchone() returns a plain tuple here (no row_factory
+        set on this cursor), so row[0] is the first column returned by
+        the RETURNING clause (enrichment_run_id) - consistent with how
+        _insert_returning() reads its result elsewhere in this file.
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -386,8 +409,23 @@ class AuditClient:
 
         return str(row[0])
 
-        
+    # -------------------- Anafa: finding_evidence --------------------
+
     def log_finding_evidence(self, evidence: FindingEvidence) -> str:
+        """
+        Upsert on (finding_instance_id, enrichment_run_id): a RETRY of
+        the same run for the same finding updates the existing row's
+        evidence values instead of creating a duplicate. A genuinely
+        NEW enrichment run (different enrichment_run_id) for the same
+        finding still creates a new row, as intended - only exact
+        retries are deduplicated.
+
+        REQUIRES a unique constraint on (finding_instance_id,
+        enrichment_run_id) in the finding_evidence table - without it,
+        the ON CONFLICT clause below fails at runtime. Run
+        add_finding_evidence_idempotency.sql (or equivalent) before
+        deploying this method.
+        """
         evidence_fields = [
             "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
             "runtime_applicability", "attack_path_reachable", "business_criticality",
@@ -402,15 +440,43 @@ class AuditClient:
             json.dumps(hashable, sort_keys=True).encode()
         ).hexdigest()
 
-        cols = [
-            "finding_instance_id", "source_finding_id", "tenant_id", "source_system",
-            "source_instance_id", "enrichment_run_id", "schema_version", "adapter_name",
-            "adapter_version", "evidence_snapshot_sha256", "cve_id", "asset_id", "cvss_base",
-            "epss_probability", "epss_percentile", "kev_status", "internet_exposure",
-            "runtime_applicability", "attack_path_reachable", "business_criticality",
-            "compensating_controls",
-        ]
-        return self._insert_returning("finding_evidence", cols, payload, "evidence_snapshot_id")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO finding_evidence
+                        (finding_instance_id, source_finding_id, tenant_id, source_system,
+                         source_instance_id, enrichment_run_id, schema_version, adapter_name,
+                         adapter_version, evidence_snapshot_sha256, cve_id, asset_id, cvss_base,
+                         epss_probability, epss_percentile, kev_status, internet_exposure,
+                         runtime_applicability, attack_path_reachable, business_criticality,
+                         compensating_controls)
+                    VALUES
+                        (%(finding_instance_id)s, %(source_finding_id)s, %(tenant_id)s, %(source_system)s,
+                         %(source_instance_id)s, %(enrichment_run_id)s, %(schema_version)s, %(adapter_name)s,
+                         %(adapter_version)s, %(evidence_snapshot_sha256)s, %(cve_id)s, %(asset_id)s, %(cvss_base)s,
+                         %(epss_probability)s, %(epss_percentile)s, %(kev_status)s, %(internet_exposure)s,
+                         %(runtime_applicability)s, %(attack_path_reachable)s, %(business_criticality)s,
+                         %(compensating_controls)s)
+                    ON CONFLICT (finding_instance_id, enrichment_run_id)
+                    DO UPDATE SET
+                        evidence_snapshot_sha256 = EXCLUDED.evidence_snapshot_sha256,
+                        cvss_base = EXCLUDED.cvss_base,
+                        epss_probability = EXCLUDED.epss_probability,
+                        epss_percentile = EXCLUDED.epss_percentile,
+                        kev_status = EXCLUDED.kev_status,
+                        internet_exposure = EXCLUDED.internet_exposure,
+                        runtime_applicability = EXCLUDED.runtime_applicability,
+                        attack_path_reachable = EXCLUDED.attack_path_reachable,
+                        business_criticality = EXCLUDED.business_criticality,
+                        compensating_controls = EXCLUDED.compensating_controls
+                    RETURNING evidence_snapshot_id
+                    """,
+                    payload,
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return str(row[0])
 
     # -------------------- Anafa: kev_catalogue --------------------
 
