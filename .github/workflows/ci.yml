@@ -1,0 +1,60 @@
+name: CI
+
+# Runs automatically on every push and every pull request.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Spins up a real, temporary PostgreSQL database for this CI
+    # run only - completely separate from production Supabase.
+    # It's destroyed automatically when the job finishes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vpap_ci
+          POSTGRES_PASSWORD: vpap_ci_password
+          POSTGRES_DB: vpap_ci_test
+        ports:
+          - 5432:5432
+        # Waits until Postgres is actually ready to accept
+        # connections before the rest of the job proceeds.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply migrations to the fresh test database
+        env:
+          VPAP_AUDIT_DSN: postgresql://vpap_ci:vpap_ci_password@localhost:5432/vpap_ci_test
+        run: python run_migrations.py
+
+      - name: Run the batch relationship test
+        env:
+          VPAP_AUDIT_DSN: postgresql://vpap_ci:vpap_ci_password@localhost:5432/vpap_ci_test
+        run: pytest tests/test_batch_relationship.py -v
+
+      - name: Run the full test suite
+        env:
+          VPAP_AUDIT_DSN: postgresql://vpap_ci:vpap_ci_password@localhost:5432/vpap_ci_test
+          VPAP_AUTH_SECRET: ci-test-secret-not-used-in-production
+        run: pytest -v
