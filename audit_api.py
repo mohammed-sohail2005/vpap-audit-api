@@ -439,11 +439,12 @@ def create_finding(
             "status": "ok",
             "finding_id": finding_id,
         }
-
-    except Exception as e:
-
-        logger.error(
-            f"Failed to upsert finding: {e}"
+    except Exception:
+        logger.exception(
+            f"Failed to upsert finding: "
+            f"cve={finding.cve_id} "
+            f"tenant={auth.tenant_id} "
+            f"source_finding_id={finding.source_finding_id}"
         )
 
         raise HTTPException(
