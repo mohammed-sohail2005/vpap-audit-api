@@ -458,27 +458,47 @@ class TicketLink(BaseModel):
 """
 Exact action values used by the audit trail.
 
-These are the values validated by AuditEvent and audit_api.py.
+These values are validated by AuditEvent and audit_api.py.
 
-Policy Engine actions requested:
+------------------------------------------------------------
+MUIZZ - INGESTION
+------------------------------------------------------------
 
-    priority_decision.completed
+finding_instance.created
+dead_letter.created
 
-    human_decision.recorded
+------------------------------------------------------------
+ANAFA - ENRICHMENT
+------------------------------------------------------------
 
-    policy_version.published
+enrichment_run.started
+enrichment_run.completed
+enrichment_run.failed
 
-    exception_record.created
-    exception_record.approved
-    exception_record.rejected
-    exception_record.expired
+finding_evidence.recorded
 
-    outbox_event.created
-    outbox_event.delivered
-    outbox_event.failed
+------------------------------------------------------------
+VIGNESH - POLICY ENGINE
+------------------------------------------------------------
 
-    ticket_link.created
+priority_decision.completed
+
+human_decision.recorded
+
+policy_version.published
+
+exception_record.created
+exception_record.approved
+exception_record.rejected
+exception_record.expired
+
+outbox_event.created
+outbox_event.delivered
+outbox_event.failed
+
+ticket_link.created
 """
+
 
 ACTIONS_BY_ENTITY: dict[str, set[str]] = {
 
@@ -499,15 +519,18 @@ ACTIONS_BY_ENTITY: dict[str, set[str]] = {
     # --------------------------------------------------------
 
     "enrichment_run": {
-        "enrichment_run.created",
+        "enrichment_run.started",
         "enrichment_run.completed",
         "enrichment_run.failed",
     },
 
     "finding_evidence": {
-        "finding_evidence.created",
-        "finding_evidence.updated",
+        "finding_evidence.recorded",
     },
+
+    # --------------------------------------------------------
+    # EXISTING ENRICHMENT CATALOGUE EVENTS
+    # --------------------------------------------------------
 
     "kev_catalogue": {
         "kev_catalogue.created",
@@ -840,18 +863,24 @@ class AuditClient:
     def update_enrichment_run(
         self,
         enrichment_run_id: str,
+        tenant_id: str,
         status: str,
         completed_at: Optional[str] = None,
     ) -> str:
         """
         Update the lifecycle status of an existing enrichment run.
 
+        Tenant isolation is enforced using both:
+
+            enrichment_run_id
+            tenant_id
+
         Typical transitions:
 
             RUNNING -> COMPLETED
             RUNNING -> FAILED
 
-        This method is exposed by audit_api.py through:
+        Exposed by audit_api.py through:
 
             PATCH /enrichment-runs/{enrichment_run_id}
         """
@@ -871,11 +900,17 @@ class AuditClient:
                     WHERE enrichment_run_id =
                         %(enrichment_run_id)s
 
+                    AND tenant_id =
+                        %(tenant_id)s
+
                     RETURNING enrichment_run_id
                     """,
                     {
                         "enrichment_run_id":
                             enrichment_run_id,
+
+                        "tenant_id":
+                            tenant_id,
 
                         "status":
                             status,
@@ -892,7 +927,8 @@ class AuditClient:
         if not row:
 
             raise ValueError(
-                f"Enrichment run not found: "
+                f"Enrichment run not found for "
+                f"tenant '{tenant_id}': "
                 f"{enrichment_run_id}"
             )
 
@@ -1492,12 +1528,10 @@ class AuditClient:
         """
         Update an exception status while enforcing tenant isolation.
 
-        IMPORTANT:
         This assumes exception_record contains an approved_at column.
 
-        If your database schema does not have approved_at, remove that
-        column from the UPDATE statement and remove the approved_at
-        argument from this method/API.
+        If the database schema does not contain approved_at,
+        remove approved_at from this method and the SQL UPDATE.
         """
 
         with self._connect() as conn:
@@ -1883,7 +1917,6 @@ class AuditClient:
         """
         Full reconstructed story of one finding.
 
-        IMPORTANT:
         Every tenant-owned query is restricted to the authenticated
         tenant. This prevents cross-tenant data exposure.
         """
@@ -1920,8 +1953,6 @@ class AuditClient:
 
                 finding = cur.fetchone()
 
-                # If finding doesn't belong to this tenant,
-                # return no history.
                 if finding is None:
 
                     return {

@@ -6,17 +6,14 @@ One REST endpoint per table, so Muizz, Anafa, Vignesh, and Sohail
 never need direct database credentials.
 
 Everyone calls this API.
+
 This service is the only component holding the real Supabase
 connection string.
 
 AUTHENTICATION
 --------------
-Every endpoint below, except:
 
-    GET /
-    POST /auth/token
-
-requires:
+Every protected endpoint requires:
 
     Authorization: Bearer <token>
 
@@ -31,13 +28,15 @@ Each token contains:
 
 The API verifies the token before allowing access.
 
-Tenant isolation is also enforced for tenant-owned data.
+Tenant isolation is enforced for tenant-owned data.
 
 ENDPOINTS
 ---------
 
-Auth:
+Health:
     GET  /
+
+Auth:
     POST /auth/token
 
 Muizz - Ingestion:
@@ -205,8 +204,9 @@ class TokenRequest(BaseModel):
 
     NOTE:
     This endpoint represents a mock IdP during the POC.
-    A production deployment should use the agreed real
-    identity provider / workload identity flow.
+
+    For the secure deployment model, tokens should be generated
+    out-of-band using generate_token.py or a real identity provider.
     """
 
     tenant_id: str
@@ -226,6 +226,11 @@ def create_token(
     The token is subsequently reused as:
 
         Authorization: Bearer <token>
+
+    IMPORTANT:
+    This endpoint should not be exposed in the final production
+    deployment if the agreed security model requires tokens to be
+    issued only out-of-band.
     """
 
     token_response = issue_token(
@@ -397,6 +402,7 @@ def create_finding(
             f"Upserted finding: "
             f"id={finding_id} "
             f"cve={finding.cve_id} "
+            f"tenant={auth.tenant_id} "
             f"by={auth.subject}"
         )
 
@@ -468,6 +474,7 @@ def create_dead_letter(
             f"Logged dead letter: "
             f"id={dl_id} "
             f"stage={entry.stage} "
+            f"tenant={auth.tenant_id} "
             f"by={auth.subject}"
         )
 
@@ -502,7 +509,8 @@ def get_finding_history(
     """
     Read-only finding history.
 
-    Tenant isolation is enforced inside audit_client.
+    The authenticated tenant is passed to the database layer,
+    which ensures that records from another tenant cannot be read.
     """
 
     try:
@@ -512,9 +520,6 @@ def get_finding_history(
             tenant_id=auth.tenant_id,
         )
 
-        # If the finding does not belong to the
-        # authenticated tenant, do not reveal whether
-        # it exists.
         if history.get("finding") is None:
 
             raise HTTPException(
@@ -580,9 +585,9 @@ class EvidenceValueRequest(BaseModel):
 
 class EnrichmentRunRequest(BaseModel):
     """
-    Tenant is REQUIRED.
+    Tenant is required.
 
-    No default='default' fallback.
+    No default tenant fallback.
     """
 
     tenant_id: str
@@ -676,18 +681,15 @@ def update_enrichment_run(
     """
     Update an enrichment run.
 
-    This is the endpoint that was missing from the deployed
-    API and caused:
-
-        PATCH /enrichment-runs/{id}
-
-        404 Not Found
+    Tenant isolation is enforced by passing the authenticated
+    tenant_id into audit_client.update_enrichment_run().
     """
 
     try:
 
         updated_id = audit_client.update_enrichment_run(
             enrichment_run_id=enrichment_run_id,
+            tenant_id=auth.tenant_id,
             status=update.status,
             completed_at=update.completed_at,
         )
@@ -732,7 +734,7 @@ def update_enrichment_run(
 
 class FindingEvidenceRequest(BaseModel):
     """
-    Tenant is REQUIRED.
+    Tenant is required.
 
     No default tenant fallback.
     """
@@ -947,14 +949,6 @@ def create_kev_catalogue_entries(
 ):
     try:
 
-        entries = [
-            KevCatalogue(
-                **{}
-            )
-            for _ in []
-        ]
-
-        # Convert API request objects into DB models.
         db_entries = [
             KevCatalogueEntry(
                 **entry.model_dump()
@@ -1153,9 +1147,9 @@ def get_latest_epss_values(
 # VIGNESH - POLICY ENGINE
 # ============================================================
 
-# ------------------------------------------------------------
+# ============================================================
 # POLICY VERSION
-# ------------------------------------------------------------
+# ============================================================
 
 class PolicyVersionRequest(BaseModel):
     version_id: str
@@ -1421,9 +1415,9 @@ def create_human_decision(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GET HUMAN DECISIONS
-# ------------------------------------------------------------
+# ============================================================
 
 @app.get(
     "/human-decisions"
@@ -1539,9 +1533,9 @@ def create_exception(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # EXCEPTION UPDATE
-# ------------------------------------------------------------
+# ============================================================
 
 class ExceptionUpdateRequest(BaseModel):
     status: Literal[
@@ -1556,9 +1550,9 @@ class ExceptionUpdateRequest(BaseModel):
     approved_at: Optional[str] = None
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GET EXCEPTIONS
-# ------------------------------------------------------------
+# ============================================================
 
 @app.get("/exceptions")
 def get_exceptions(
@@ -1594,9 +1588,9 @@ def get_exceptions(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # PATCH EXCEPTION
-# ------------------------------------------------------------
+# ============================================================
 
 @app.patch(
     "/exceptions/{exception_id}"
@@ -1750,9 +1744,9 @@ def create_outbox_event(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GET OUTBOX EVENTS
-# ------------------------------------------------------------
+# ============================================================
 
 @app.get(
     "/outbox-events"
@@ -1794,9 +1788,9 @@ def get_outbox_events(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # OUTBOX UPDATE
-# ------------------------------------------------------------
+# ============================================================
 
 class OutboxEventUpdateRequest(BaseModel):
     status: Literal[
@@ -1813,9 +1807,9 @@ class OutboxEventUpdateRequest(BaseModel):
     error_message: Optional[str] = None
 
 
-# ------------------------------------------------------------
+# ============================================================
 # PATCH OUTBOX EVENT
-# ------------------------------------------------------------
+# ============================================================
 
 @app.patch(
     "/outbox-events/{outbox_event_id}"
@@ -2009,9 +2003,9 @@ class AuditEventRequest(BaseModel):
         return self
 
 
-# ------------------------------------------------------------
+# ============================================================
 # CREATE AUDIT EVENT
-# ------------------------------------------------------------
+# ============================================================
 
 @app.post(
     "/audit-events"
@@ -2067,9 +2061,9 @@ def create_audit_event(
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # GET AUDIT TRAIL
-# ------------------------------------------------------------
+# ============================================================
 
 @app.get(
     "/audit-events/{correlation_id}"
