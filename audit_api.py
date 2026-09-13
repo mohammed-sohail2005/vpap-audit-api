@@ -87,6 +87,7 @@ from psycopg.errors import UniqueViolation
 
 from auth import (
     issue_token,
+    authenticate_vending_credential,
     require_auth,
     require_tenant_match,
     AuthContext,
@@ -195,59 +196,87 @@ def health_check():
 
 
 # ============================================================
-# AUTHENTICATION
+# AUTHENTICATION / TOKEN VENDING
 # ============================================================
 
-class TokenRequest(BaseModel):
+class VendingTokenRequest(BaseModel):
     """
-    POC token request.
+    Request a short-lived VPAP persistence token.
 
-    NOTE:
-    This endpoint represents a mock IdP during the POC.
+    The client provides ONLY its vending credential.
 
-    For the secure deployment model, tokens should be generated
-    out-of-band using generate_token.py or a real identity provider.
+    The client does NOT provide:
+        tenant_id
+        subject
+        scope
+
+    Those values are determined by the server-side vending
+    credential configuration.
     """
 
-    tenant_id: str
+    vending_credential: str = Field(
+        ...,
+        min_length=16,
+        description=(
+            "Private credential assigned to this service "
+            "for token vending."
+        ),
+    )
 
-    scope: str = "persistence:*"
 
-    subject: str
-
-
-@app.post("/auth/token")
-def create_token(
-    request: TokenRequest,
+@app.post(
+    "/auth/vend-token"
+)
+def vend_token(
+    request: VendingTokenRequest,
 ):
     """
-    Mock token issuance for the current POC.
+    Secure token vending endpoint.
 
-    The token is subsequently reused as:
+    Flow:
 
-        Authorization: Bearer <token>
+        vending credential
+                ↓
+        server-side lookup
+                ↓
+        subject + tenant + scope
+                ↓
+        issue_token()
+                ↓
+        short-lived JWT
 
-    IMPORTANT:
-    This endpoint should not be exposed in the final production
-    deployment if the agreed security model requires tokens to be
-    issued only out-of-band.
+    SECURITY:
+
+    The caller cannot choose:
+
+        tenant_id
+        subject
+        scope
+
+    Those values are fixed by the server-side credential
+    configuration.
+
+    The vending credential itself is never logged.
     """
 
+    identity = authenticate_vending_credential(
+        request.vending_credential
+    )
+
     token_response = issue_token(
-        tenant_id=request.tenant_id,
-        scope=request.scope,
-        subject=request.subject,
+        tenant_id=identity.tenant_id,
+        scope=identity.scope,
+        subject=identity.subject,
     )
 
     logger.info(
-        "Issued token: "
-        f"subject={request.subject} "
-        f"tenant={request.tenant_id} "
-        f"scope={request.scope}"
+        "Issued vending token: "
+        f"subject={identity.subject} "
+        f"tenant={identity.tenant_id} "
+        f"scope={identity.scope}"
     )
 
     return token_response
-
 
 # ============================================================
 # MUIZZ - INGESTION & VALIDATION
