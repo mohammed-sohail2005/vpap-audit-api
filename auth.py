@@ -54,7 +54,9 @@ AUTH_SECRET = os.environ["VPAP_AUTH_SECRET"]
 
 AUTH_ALGORITHM = "HS256"
 
-
+import hashlib
+_secret_fingerprint = hashlib.sha256(AUTH_SECRET.encode()).hexdigest()[:8]
+print(f"[auth] VPAP_AUTH_SECRET fingerprint at startup: {_secret_fingerprint}")
 # Issuer and audience identify where the token came from
 # and which API it is intended for.
 TOKEN_ISSUER = os.environ.get(
