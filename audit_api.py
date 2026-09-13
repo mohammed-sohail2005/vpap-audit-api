@@ -37,7 +37,7 @@ Health:
     GET  /
 
 Auth:
-    POST /auth/token
+    POST /auth/vend-token
 
 Muizz - Ingestion:
     POST /ingestion-batches
@@ -210,8 +210,7 @@ class VendingTokenRequest(BaseModel):
         subject
         scope
 
-    Those values are determined by the server-side vending
-    credential configuration.
+    Those values are determined by server-side configuration.
     """
 
     vending_credential: str = Field(
@@ -224,9 +223,7 @@ class VendingTokenRequest(BaseModel):
     )
 
 
-@app.post(
-    "/auth/vend-token"
-)
+@app.post("/auth/vend-token")
 def vend_token(
     request: VendingTokenRequest,
 ):
@@ -244,19 +241,6 @@ def vend_token(
         issue_token()
                 ↓
         short-lived JWT
-
-    SECURITY:
-
-    The caller cannot choose:
-
-        tenant_id
-        subject
-        scope
-
-    Those values are fixed by the server-side credential
-    configuration.
-
-    The vending credential itself is never logged.
     """
 
     identity = authenticate_vending_credential(
@@ -278,13 +262,13 @@ def vend_token(
 
     return token_response
 
+
 # ============================================================
 # MUIZZ - INGESTION & VALIDATION
 # ============================================================
 
 class IngestionBatchRequest(BaseModel):
     tenant_id: str
-
     source_system: str
 
     source_type: Literal[
@@ -294,23 +278,16 @@ class IngestionBatchRequest(BaseModel):
     ]
 
     source_reference: Optional[str] = None
-
     source_file_name: Optional[str] = None
-
     processing_started_at: Optional[str] = None
-
     processing_completed_at: Optional[str] = None
 
     total_records: int = 0
-
     accepted_records: int = 0
-
     rejected_records: int = 0
-
     validation_failed_records: int = 0
 
     status: str = "RECEIVED"
-
     error_message: Optional[str] = None
 
 
@@ -322,8 +299,7 @@ def create_ingestion_batch(
     """
     Create an ingestion batch.
 
-    The tenant in the request must match the tenant
-    contained in the authenticated token.
+    The tenant in the request must match the authenticated tenant.
     """
 
     require_tenant_match(
@@ -369,27 +345,17 @@ def create_ingestion_batch(
 
 class FindingRequest(BaseModel):
     tenant_id: str
-
     source_system: str
-
     source_finding_id: str
-
     cve_id: str
-
     asset_id: str
 
     package_id: Optional[str] = None
-
     cvss_base: Optional[float] = None
-
     cvss_vector: Optional[str] = None
-
     description: Optional[str] = None
-
     business_service_id: Optional[str] = None
-
     internet_exposed: Optional[bool] = None
-
     first_detected_at: Optional[str] = None
 
     status: str = "VALID"
@@ -402,16 +368,6 @@ def create_finding(
 ):
     """
     Idempotent finding upsert.
-
-    Same:
-
-        tenant
-        source_system
-        source_finding_id
-        asset_id
-        package_id
-
-    returns the existing finding instead of creating a duplicate.
     """
 
     require_tenant_match(
@@ -439,7 +395,9 @@ def create_finding(
             "status": "ok",
             "finding_id": finding_id,
         }
+
     except Exception:
+
         logger.exception(
             f"Failed to upsert finding: "
             f"cve={finding.cve_id} "
@@ -459,11 +417,9 @@ def create_finding(
 
 class DeadLetterRequest(BaseModel):
     tenant_id: str
-
     source_system: str
 
     batch_id: Optional[str] = None
-
     source_finding_id: Optional[str] = None
 
     stage: Literal[
@@ -472,13 +428,11 @@ class DeadLetterRequest(BaseModel):
     ]
 
     error_code: str
-
     error_message: str
 
     raw_record: Optional[dict] = None
 
     status: str = "OPEN"
-
     retry_count: int = 0
 
 
@@ -529,9 +483,7 @@ def create_dead_letter(
 # FINDING HISTORY
 # ============================================================
 
-@app.get(
-    "/findings/{finding_id}/history"
-)
+@app.get("/findings/{finding_id}/history")
 def get_finding_history(
     finding_id: str,
     auth: AuthContext = Depends(require_auth),
@@ -539,8 +491,7 @@ def get_finding_history(
     """
     Read-only finding history.
 
-    The authenticated tenant is passed to the database layer,
-    which ensures that records from another tenant cannot be read.
+    Tenant isolation is enforced by audit_client.
     """
 
     try:
@@ -580,9 +531,7 @@ def get_finding_history(
 
 class EvidenceValueRequest(BaseModel):
     value: Optional[Any] = None
-
     raw_value: Optional[Any] = None
-
     mapping_version: Optional[str] = None
 
     status: Literal[
@@ -593,13 +542,9 @@ class EvidenceValueRequest(BaseModel):
     ]
 
     reason_code: Optional[str] = None
-
     source: str
-
     source_field: Optional[str] = None
-
     source_timestamp: Optional[str] = None
-
     retrieved_at: str
 
     confidence: Literal[
@@ -614,26 +559,16 @@ class EvidenceValueRequest(BaseModel):
 # ============================================================
 
 class EnrichmentRunRequest(BaseModel):
-    """
-    Tenant is required.
-
-    No default tenant fallback.
-    """
-
     tenant_id: str
-
     source_system: str
 
     source_instance_id: Optional[str] = None
 
     adapter_name: str
-
     adapter_version: str
-
     schema_version: str
 
     started_at: Optional[str] = None
-
     completed_at: Optional[str] = None
 
     status: str
@@ -686,37 +621,29 @@ def create_enrichment_run(
 # ============================================================
 
 class EnrichmentRunUpdateRequest(BaseModel):
-    """
-    Update an existing enrichment run.
-
-    Typical usage:
-
-        RUNNING -> COMPLETED
-        RUNNING -> FAILED
-    """
     tenant_id: str
     status: str
-
     completed_at: Optional[str] = None
 
 
-@app.patch(
-    "/enrichment-runs/{enrichment_run_id}"
-)
+@app.patch("/enrichment-runs/{enrichment_run_id}")
 def update_enrichment_run(
     enrichment_run_id: str,
     update: EnrichmentRunUpdateRequest,
     auth: AuthContext = Depends(require_auth),
 ):
-    
     """
-    Update an enrichment run.
+    Update an existing enrichment run.
 
-    Tenant isolation is enforced by passing the authenticated
-    tenant_id into audit_client.update_enrichment_run().
+    Tenant isolation is enforced using the authenticated
+    tenant ID.
     """
 
-    require_tenant_match(auth, update.tenant_id)
+    require_tenant_match(
+        auth,
+        update.tenant_id,
+    )
+
     try:
 
         updated_id = audit_client.update_enrichment_run(
@@ -725,6 +652,13 @@ def update_enrichment_run(
             status=update.status,
             completed_at=update.completed_at,
         )
+
+        if updated_id is None:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Enrichment run not found.",
+            )
 
         logger.info(
             f"Updated enrichment run: "
@@ -740,12 +674,8 @@ def update_enrichment_run(
             "run_status": update.status,
         }
 
-    except ValueError:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Enrichment run not found.",
-        )
+    except HTTPException:
+        raise
 
     except Exception as e:
 
@@ -765,50 +695,31 @@ def update_enrichment_run(
 # ============================================================
 
 class FindingEvidenceRequest(BaseModel):
-    """
-    Tenant is required.
-
-    No default tenant fallback.
-    """
-
     finding_instance_id: str
-
     source_finding_id: str
 
     tenant_id: str
-
     source_system: str
 
     source_instance_id: Optional[str] = None
 
     enrichment_run_id: str
-
     schema_version: str
-
     adapter_name: str
-
     adapter_version: str
 
     cve_id: str
-
     asset_id: str
 
     cvss_base: Optional[float] = None
 
     epss_probability: EvidenceValueRequest
-
     epss_percentile: EvidenceValueRequest
-
     kev_status: EvidenceValueRequest
-
     internet_exposure: EvidenceValueRequest
-
     runtime_applicability: EvidenceValueRequest
-
     attack_path_reachable: EvidenceValueRequest
-
     business_criticality: EvidenceValueRequest
-
     compensating_controls: EvidenceValueRequest
 
 
@@ -905,11 +816,8 @@ def create_finding_evidence(
 
 class KevCatalogueRequest(BaseModel):
     source_timestamp: Optional[str] = None
-
     catalogue_sha256: str
-
     record_count: int
-
     status: str
 
 
@@ -919,10 +827,7 @@ def create_kev_catalogue(
     auth: AuthContext = Depends(require_auth),
 ):
     """
-    KEV catalogue is treated as a shared global feed.
-
-    Therefore no tenant_id is required here.
-    Authentication is still required.
+    KEV catalogue is a shared global feed.
     """
 
     try:
@@ -962,19 +867,14 @@ def create_kev_catalogue(
 
 class KevCatalogueEntryRequest(BaseModel):
     catalogue_id: str
-
     cve_id: str
 
 
 class KevCatalogueEntriesRequest(BaseModel):
-    entries: list[
-        KevCatalogueEntryRequest
-    ]
+    entries: list[KevCatalogueEntryRequest]
 
 
-@app.post(
-    "/kev-catalogue-entries"
-)
+@app.post("/kev-catalogue-entries")
 def create_kev_catalogue_entries(
     request: KevCatalogueEntriesRequest,
     auth: AuthContext = Depends(require_auth),
@@ -1020,7 +920,6 @@ def create_kev_catalogue_entries(
 
 class EpssSnapshotRequest(BaseModel):
     source_timestamp: Optional[str] = None
-
     record_count: int
 
 
@@ -1031,8 +930,6 @@ def create_epss_snapshot(
 ):
     """
     EPSS is a shared global feed.
-
-    Authentication is required, but tenant matching is not.
     """
 
     try:
@@ -1072,23 +969,16 @@ def create_epss_snapshot(
 
 class EpssSnapshotEntryRequest(BaseModel):
     snapshot_id: str
-
     cve_id: str
-
     epss_probability: float
-
     epss_percentile: float
 
 
 class EpssSnapshotEntriesRequest(BaseModel):
-    entries: list[
-        EpssSnapshotEntryRequest
-    ]
+    entries: list[EpssSnapshotEntryRequest]
 
 
-@app.post(
-    "/epss-snapshot-entries"
-)
+@app.post("/epss-snapshot-entries")
 def create_epss_snapshot_entries(
     request: EpssSnapshotEntriesRequest,
     auth: AuthContext = Depends(require_auth),
@@ -1132,9 +1022,7 @@ def create_epss_snapshot_entries(
 # LATEST EPSS VALUES
 # ============================================================
 
-@app.get(
-    "/epss-snapshot-entries/latest"
-)
+@app.get("/epss-snapshot-entries/latest")
 def get_latest_epss_values(
     cve_ids: str,
     auth: AuthContext = Depends(require_auth),
@@ -1193,9 +1081,7 @@ class PolicyVersionRequest(BaseModel):
     author: str
 
     thresholds_json: dict
-
     weights_json: dict
-
     sla_json: dict
 
     conservative_floor_default: Priority = "P0"
@@ -1205,9 +1091,7 @@ class PolicyVersionRequest(BaseModel):
     is_active: bool = True
 
 
-@app.post(
-    "/policy-versions"
-)
+@app.post("/policy-versions")
 def create_policy_version(
     policy: PolicyVersionRequest,
     auth: AuthContext = Depends(require_auth),
@@ -1325,10 +1209,23 @@ def create_decision(
     auth: AuthContext = Depends(require_auth),
 ):
     """
-    Priority decisions are versioned.
+    Create a priority decision and its audit event.
 
-    An override creates another decision rather than mutating
-    the previous decision.
+    Flow:
+
+        Policy Engine
+              |
+              v
+        priority_decision
+              |
+              v
+        priority_decision.completed
+              |
+              v
+        finding audit history
+
+    The audit event is linked to the finding using
+    correlation_id=decision.finding_id.
     """
 
     require_tenant_match(
@@ -1338,16 +1235,83 @@ def create_decision(
 
     try:
 
+        # --------------------------------------------------------
+        # 1. Create the priority decision
+        # --------------------------------------------------------
+
         decision_id = audit_client.log_decision(
             PriorityDecision(
                 **decision.model_dump()
             )
         )
 
+        # --------------------------------------------------------
+        # 2. Create audit event for the decision
+        # --------------------------------------------------------
+
+        audit_event = DBAuditEvent(
+            actor_type="system",
+            actor_id=auth.subject,
+
+            action="priority_decision.completed",
+
+            entity_type="priority_decision",
+            entity_id=decision_id,
+
+            # The finding ID is used as the correlation ID so
+            # this event can appear in finding history.
+            correlation_id=decision.finding_id,
+
+            tenant_id=auth.tenant_id,
+
+            policy_version=decision.policy_version,
+
+            evidence_ref=decision.evidence_snapshot_id,
+
+            before_state=None,
+
+            after_state={
+                "priority_decision_id": decision_id,
+                "finding_id": decision.finding_id,
+                "evidence_snapshot_id": (
+                    decision.evidence_snapshot_id
+                ),
+                "policy_version": (
+                    decision.policy_version
+                ),
+                "mandatory_remediation": (
+                    decision.mandatory_remediation
+                ),
+                "vps": decision.vps,
+                "operational_priority": (
+                    decision.operational_priority
+                ),
+                "ssvc_outcome": decision.ssvc_outcome,
+                "confidence": decision.confidence,
+                "decision_status": decision.decision_status,
+                "conservative_floor": (
+                    decision.conservative_floor
+                ),
+                "sla_hours": decision.sla_hours,
+                "sla_due_at": decision.sla_due_at,
+                "rules_applied": decision.rules_applied,
+                "evidence_refs": decision.evidence_refs,
+            },
+        )
+
+        audit_client.log(
+            audit_event
+        )
+
+        # --------------------------------------------------------
+        # 3. Log successful operation
+        # --------------------------------------------------------
+
         logger.info(
-            f"Logged decision: "
+            f"Logged decision and audit event: "
             f"id={decision_id} "
             f"priority={decision.operational_priority} "
+            f"finding={decision.finding_id} "
             f"tenant={auth.tenant_id} "
             f"by={auth.subject}"
         )
@@ -1403,9 +1367,7 @@ class HumanDecisionRequest(BaseModel):
     signatures_json: list
 
 
-@app.post(
-    "/human-decisions"
-)
+@app.post("/human-decisions")
 def create_human_decision(
     decision: HumanDecisionRequest,
     auth: AuthContext = Depends(require_auth),
@@ -1451,19 +1413,13 @@ def create_human_decision(
 # GET HUMAN DECISIONS
 # ============================================================
 
-@app.get(
-    "/human-decisions"
-)
+@app.get("/human-decisions")
 def get_human_decisions(
     finding_id: str,
     auth: AuthContext = Depends(require_auth),
 ):
     """
     Retrieve human review decisions for a finding.
-
-    Example:
-
-        GET /human-decisions?finding_id=<id>
     """
 
     try:
@@ -1624,9 +1580,7 @@ def get_exceptions(
 # PATCH EXCEPTION
 # ============================================================
 
-@app.patch(
-    "/exceptions/{exception_id}"
-)
+@app.patch("/exceptions/{exception_id}")
 def update_exception(
     exception_id: str,
     update: ExceptionUpdateRequest,
@@ -1634,21 +1588,15 @@ def update_exception(
 ):
     """
     Approve/reject/expire an exception.
-
-    Tenant isolation is enforced by audit_client.
     """
 
     try:
 
         updated = audit_client.update_exception(
             exception_id=exception_id,
-
             tenant_id=auth.tenant_id,
-
             status=update.status,
-
             approver=update.approver,
-
             approved_at=update.approved_at,
         )
 
@@ -1711,9 +1659,7 @@ class OutboxEventRequest(BaseModel):
     error_message: Optional[str] = None
 
 
-@app.post(
-    "/outbox-events"
-)
+@app.post("/outbox-events")
 def create_outbox_event(
     event: OutboxEventRequest,
     auth: AuthContext = Depends(require_auth),
@@ -1780,19 +1726,13 @@ def create_outbox_event(
 # GET OUTBOX EVENTS
 # ============================================================
 
-@app.get(
-    "/outbox-events"
-)
+@app.get("/outbox-events")
 def get_outbox_events(
     status: Optional[str] = None,
     auth: AuthContext = Depends(require_auth),
 ):
     """
     Get outbox events belonging only to the authenticated tenant.
-
-    Example:
-
-        GET /outbox-events?status=PENDING
     """
 
     try:
@@ -1839,13 +1779,7 @@ class OutboxEventUpdateRequest(BaseModel):
     error_message: Optional[str] = None
 
 
-# ============================================================
-# PATCH OUTBOX EVENT
-# ============================================================
-
-@app.patch(
-    "/outbox-events/{outbox_event_id}"
-)
+@app.patch("/outbox-events/{outbox_event_id}")
 def update_outbox_event(
     outbox_event_id: str,
     update: OutboxEventUpdateRequest,
@@ -1855,15 +1789,10 @@ def update_outbox_event(
 
         updated = audit_client.update_outbox_event(
             outbox_event_id=outbox_event_id,
-
             tenant_id=auth.tenant_id,
-
             status=update.status,
-
             external_id=update.external_id,
-
             retry_count=update.retry_count,
-
             error_message=update.error_message,
         )
 
@@ -1930,9 +1859,7 @@ class TicketLinkRequest(BaseModel):
     last_synced_at: Optional[str] = None
 
 
-@app.post(
-    "/ticket-links"
-)
+@app.post("/ticket-links")
 def create_ticket_link(
     ticket: TicketLinkRequest,
     auth: AuthContext = Depends(require_auth),
@@ -2001,9 +1928,7 @@ class AuditEventRequest(BaseModel):
 
     after_state: Optional[dict] = None
 
-    @model_validator(
-        mode="after"
-    )
+    @model_validator(mode="after")
     def validate_action_for_entity_type(
         self,
     ) -> "AuditEventRequest":
@@ -2039,9 +1964,7 @@ class AuditEventRequest(BaseModel):
 # CREATE AUDIT EVENT
 # ============================================================
 
-@app.post(
-    "/audit-events"
-)
+@app.post("/audit-events")
 def create_audit_event(
     event: AuditEventRequest,
     auth: AuthContext = Depends(require_auth),
@@ -2097,9 +2020,7 @@ def create_audit_event(
 # GET AUDIT TRAIL
 # ============================================================
 
-@app.get(
-    "/audit-events/{correlation_id}"
-)
+@app.get("/audit-events/{correlation_id}")
 def get_audit_trail(
     correlation_id: str,
     auth: AuthContext = Depends(require_auth),
