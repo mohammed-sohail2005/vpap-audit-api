@@ -2,10 +2,8 @@ name: Refresh VPAP Tokens
 
 on:
   schedule:
-    # Run automatically every 8 hours
     - cron: "0 */8 * * *"
 
-  # Allows manual testing from GitHub
   workflow_dispatch:
 
 jobs:
@@ -33,7 +31,7 @@ jobs:
           TOKEN=$(python generate_token.py \
             --subject ingestion-service \
             --tenant-id vpap-pilot \
-            --quiet)
+            --quiet | tail -n 1)
 
           echo "::add-mask::$TOKEN"
           echo "INGESTION_TOKEN=$TOKEN" >> "$GITHUB_ENV"
@@ -45,7 +43,7 @@ jobs:
           TOKEN=$(python generate_token.py \
             --subject enrichment-service \
             --tenant-id vpap-pilot \
-            --quiet)
+            --quiet | tail -n 1)
 
           echo "::add-mask::$TOKEN"
           echo "ENRICHMENT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
@@ -57,7 +55,7 @@ jobs:
           TOKEN=$(python generate_token.py \
             --subject policy-engine \
             --tenant-id vpap-pilot \
-            --quiet)
+            --quiet | tail -n 1)
 
           echo "::add-mask::$TOKEN"
           echo "POLICY_TOKEN=$TOKEN" >> "$GITHUB_ENV"
