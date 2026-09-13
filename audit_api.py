@@ -664,7 +664,7 @@ class EnrichmentRunUpdateRequest(BaseModel):
         RUNNING -> COMPLETED
         RUNNING -> FAILED
     """
-
+    tenant_id: str
     status: str
 
     completed_at: Optional[str] = None
@@ -678,6 +678,7 @@ def update_enrichment_run(
     update: EnrichmentRunUpdateRequest,
     auth: AuthContext = Depends(require_auth),
 ):
+    
     """
     Update an enrichment run.
 
@@ -685,6 +686,7 @@ def update_enrichment_run(
     tenant_id into audit_client.update_enrichment_run().
     """
 
+    require_tenant_match(auth, update.tenant_id)
     try:
 
         updated_id = audit_client.update_enrichment_run(
