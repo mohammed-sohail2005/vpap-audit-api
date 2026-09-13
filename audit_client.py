@@ -22,7 +22,7 @@ import hashlib
 import json
 from typing import Optional, Literal, Generic, TypeVar, Any
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import psycopg
 from psycopg.types.json import Json
 from dotenv import load_dotenv
@@ -58,7 +58,6 @@ class IngestionBatch(BaseModel):
 
 class FindingInstance(BaseModel):
     tenant_id: str
-    batch_id: Optional[str] = None
     source_system: str
     source_finding_id: str
     cve_id: str
@@ -265,6 +264,29 @@ class TicketLink(BaseModel):
 # SOHAIL - Audit
 # ============================================================
 
+# Which action values are valid for each entity_type. This is
+# intentionally a plain dict (not a hardcoded Literal enum) so new
+# entries can be appended as each teammate confirms their own action
+# vocabulary, without restructuring this file each time.
+#
+# Confirmed so far:
+#   - Muizz (ingestion):  finding_instance, dead_letter
+#   - Anafa (enrichment):  not yet confirmed - pending her list
+#   - Vignesh (policy):    not yet confirmed - pending his list
+#
+# When Anafa/Vignesh send their action values, add their entity_type
+# keys and action lists here - nothing else in this file needs to
+# change for the validation below to start covering them too.
+ACTIONS_BY_ENTITY: dict[str, set[str]] = {
+    "finding_instance": {
+        "finding_instance.created",
+    },
+    "dead_letter": {
+        "dead_letter.created",
+    },
+}
+
+
 class AuditEvent(BaseModel):
     actor_type: ActorType
     actor_id: str
@@ -278,13 +300,30 @@ class AuditEvent(BaseModel):
     before_state: Optional[dict] = None
     after_state: Optional[dict] = None
     source_ip: Optional[str] = None
-    # NOTE: entity_type is still plain `str` here. An EntityType Literal +
-    # ACTIONS_BY_ENTITY model_validator was built and deployed at one point
-    # to reject invalid entity_type/action combinations with a clean 422
-    # instead of a vague 500 - that logic is not present in this version.
-    # Recover it from git history (git log --all -S "ACTIONS_BY_ENTITY")
-    # rather than rebuilding from scratch, so the restored rules match
-    # what was actually agreed on before.
+
+    @model_validator(mode="after")
+    def validate_action_for_entity_type(self) -> "AuditEvent":
+        """
+        Rejects an entity_type/action combination that isn't in
+        ACTIONS_BY_ENTITY, with a clear error message - instead of
+        silently accepting a typo'd action name (e.g.
+        "finding_isntance.created") that would otherwise sit in the
+        audit trail unnoticed until someone tries to query for the
+        correctly-spelled action and gets confused by missing rows.
+
+        entity_types not yet listed in ACTIONS_BY_ENTITY at all (e.g.
+        Anafa's/Vignesh's, before they send their lists) are allowed
+        through unchecked for now, so this doesn't block teams whose
+        action vocabulary hasn't been confirmed yet - only entity_types
+        that ARE listed get their action value checked against the list.
+        """
+        allowed_actions = ACTIONS_BY_ENTITY.get(self.entity_type)
+        if allowed_actions is not None and self.action not in allowed_actions:
+            raise ValueError(
+                f"Invalid action '{self.action}' for entity_type '{self.entity_type}'. "
+                f"Allowed actions: {sorted(allowed_actions)}"
+            )
+        return self
 
 
 # ============================================================
@@ -329,42 +368,28 @@ class AuditClient:
 
     def upsert_finding(self, finding: FindingInstance) -> str:
         key = finding.idempotency_key()
-    
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO public.finding_instance
-                        (tenant_id, batch_id, idempotency_key, source_system,
-                         source_finding_id, cve_id, asset_id, package_id,
-                         cvss_base, cvss_vector, description,
-                         business_service_id, internet_exposed, first_detected_at,
-                         status, first_seen_at, last_seen_at)
+                        (tenant_id, idempotency_key, source_system, source_finding_id, cve_id,
+                         asset_id, package_id, cvss_base, cvss_vector, description,
+                         business_service_id, internet_exposed, first_detected_at, status,
+                         first_seen_at, last_seen_at)
                     VALUES
-                        (%(tenant_id)s, %(batch_id)s, %(idempotency_key)s,
-                         %(source_system)s, %(source_finding_id)s, %(cve_id)s,
-                         %(asset_id)s, %(package_id)s, %(cvss_base)s,
-                         %(cvss_vector)s, %(description)s,
-                         %(business_service_id)s, %(internet_exposed)s,
+                        (%(tenant_id)s, %(idempotency_key)s, %(source_system)s, %(source_finding_id)s,
+                         %(cve_id)s, %(asset_id)s, %(package_id)s, %(cvss_base)s, %(cvss_vector)s,
+                         %(description)s, %(business_service_id)s, %(internet_exposed)s,
                          %(first_detected_at)s, %(status)s, now(), now())
                     ON CONFLICT (tenant_id, idempotency_key)
-                    DO UPDATE SET
-                        batch_id = EXCLUDED.batch_id,
-                        last_seen_at = now(),
-                        status = EXCLUDED.status,
-                        updated_at = now()
+                    DO UPDATE SET last_seen_at = now(), status = EXCLUDED.status, updated_at = now()
                     RETURNING id
                     """,
-                    {
-                        **finding.model_dump(),
-                        "idempotency_key": key,
-                    },
+                    {**finding.model_dump(), "idempotency_key": key},
                 )
-    
                 row = cur.fetchone()
-    
             conn.commit()
-    
         return str(row[0])
 
     # -------------------- Muizz: dead_letter --------------------
@@ -428,18 +453,21 @@ class AuditClient:
 
     def log_finding_evidence(self, evidence: FindingEvidence) -> str:
         """
-        Upsert on (finding_instance_id, enrichment_run_id): a RETRY of
-        the same run for the same finding updates the existing row's
-        evidence values instead of creating a duplicate. A genuinely
-        NEW enrichment run (different enrichment_run_id) for the same
-        finding still creates a new row, as intended - only exact
-        retries are deduplicated.
+        Insert or update evidence for one finding.
 
-        REQUIRES a unique constraint on (finding_instance_id,
-        enrichment_run_id) in the finding_evidence table - without it,
-        the ON CONFLICT clause below fails at runtime. Run
-        add_finding_evidence_idempotency.sql (or equivalent) before
-        deploying this method.
+        IDEMPOTENT as of this version: upserts on
+        (finding_instance_id, enrichment_run_id) via a unique
+        constraint (see add_finding_evidence_idempotency.sql - must
+        be applied to the database before this code path is used,
+        or the ON CONFLICT clause below has nothing to match against).
+
+        A RETRY of the same enrichment run for the same finding
+        updates the existing row's evidence values in place, rather
+        than creating a duplicate row - this is what makes Anafa's
+        client-side retry logic safe to use against this endpoint.
+        A genuinely NEW enrichment run (different enrichment_run_id)
+        for the same finding still creates a new row, as intended -
+        only exact retries (same finding + same run) are deduplicated.
         """
         evidence_fields = [
             "epss_probability", "epss_percentile", "kev_status", "internet_exposure",

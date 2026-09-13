@@ -17,7 +17,7 @@ tenant's data).
 
     Auth:                POST /auth/token
     Muizz (ingestion):   POST /ingestion-batches, POST /findings, POST /dead-letters
-    Anafa (enrichment):  POST /enrichment-runs, PATCH /enrichment-runs/{id}, POST /evidence,
+    Anafa (enrichment):  POST /enrichment-runs, POST /evidence,
                          POST /kev-catalogue, POST /kev-catalogue-entries,
                          POST /epss-snapshots, POST /epss-snapshot-entries,
                          GET /epss-snapshot-entries/latest
@@ -33,7 +33,7 @@ Run locally with:
 
 from typing import Optional, Literal, Any
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import logging
 
 from auth import issue_token, require_auth, require_tenant_match, AuthContext
@@ -47,6 +47,7 @@ from audit_client import (
     PolicyVersion, PriorityDecision, HumanDecision, ExceptionRecord,
     OutboxEvent, TicketLink,
     AuditEvent as DBAuditEvent,
+    ACTIONS_BY_ENTITY,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -137,7 +138,6 @@ def create_ingestion_batch(batch: IngestionBatchRequest, auth: AuthContext = Dep
 
 class FindingRequest(BaseModel):
     tenant_id: str
-    batch_id: Optional[str] = None
     source_system: str
     source_finding_id: str
     cve_id: str
@@ -228,6 +228,7 @@ class EnrichmentRunRequest(BaseModel):
     completed_at: Optional[str] = None
     status: str
 
+
 @app.post("/enrichment-runs")
 def create_enrichment_run(run: EnrichmentRunRequest, auth: AuthContext = Depends(require_auth)):
     require_tenant_match(auth, run.tenant_id)
@@ -238,52 +239,6 @@ def create_enrichment_run(run: EnrichmentRunRequest, auth: AuthContext = Depends
     except Exception as e:
         logger.error(f"Failed to log enrichment run: {e}")
         raise HTTPException(status_code=500, detail="Failed to record enrichment run.")
-
-
-class EnrichmentRunUpdateRequest(BaseModel):
-    tenant_id: str
-    status: Literal["COMPLETED", "FAILED"]
-    completed_at: str
-
-@app.patch("/enrichment-runs/{enrichment_run_id}")
-def update_enrichment_run(
-    enrichment_run_id: str,
-    update: EnrichmentRunUpdateRequest,
-    auth: AuthContext = Depends(require_auth),
-):
-    # Defense-in-depth: same tenant check every other write endpoint
-    # applies - without this, any valid token (for ANY tenant) could
-    # update ANY enrichment run, since enrichment_run_id alone doesn't
-    # prove ownership.
-    require_tenant_match(auth, update.tenant_id)
-    try:
-        run_id = audit_client.update_enrichment_run(
-            enrichment_run_id=enrichment_run_id,
-            status=update.status,
-            completed_at=update.completed_at,
-        )
-
-        logger.info(
-            f"Updated enrichment run: id={run_id} "
-            f"status={update.status} by={auth.subject}"
-        )
-
-        return {
-            "status": "ok",
-            "enrichment_run_id": run_id,
-            "run_status": update.status,
-        }
-
-    except ValueError as e:
-        logger.error(f"Enrichment run not found: {e}")
-        raise HTTPException(status_code=404, detail=str(e))
-
-    except Exception as e:
-        logger.error(f"Failed to update enrichment run: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to update enrichment run.",
-        )
 
 
 class FindingEvidenceRequest(BaseModel):
@@ -604,6 +559,24 @@ class AuditEventRequest(BaseModel):
     evidence_ref: Optional[str] = None
     before_state: Optional[dict] = None
     after_state: Optional[dict] = None
+
+    @model_validator(mode="after")
+    def validate_action_for_entity_type(self) -> "AuditEventRequest":
+        """
+        Mirrors audit_client.AuditEvent's validator (same ACTIONS_BY_ENTITY
+        source of truth). Placing this on the REQUEST model specifically
+        means FastAPI rejects an invalid action/entity_type pair with a
+        clean 422 automatically, before create_audit_event() below even
+        runs - rather than surfacing as a generic 500 caught by the
+        try/except further down.
+        """
+        allowed_actions = ACTIONS_BY_ENTITY.get(self.entity_type)
+        if allowed_actions is not None and self.action not in allowed_actions:
+            raise ValueError(
+                f"Invalid action '{self.action}' for entity_type '{self.entity_type}'. "
+                f"Allowed actions: {sorted(allowed_actions)}"
+            )
+        return self
 
 
 @app.post("/audit-events")
