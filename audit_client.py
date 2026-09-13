@@ -270,19 +270,29 @@ class TicketLink(BaseModel):
 # vocabulary, without restructuring this file each time.
 #
 # Confirmed so far:
-#   - Muizz (ingestion):  finding_instance, dead_letter
+#   - Muizz (ingestion):   finding_instance, dead_letter
 #   - Anafa (enrichment):  not yet confirmed - pending her list
-#   - Vignesh (policy):    not yet confirmed - pending his list
+#   - Vignesh (policy):    priority_decision
 #
-# When Anafa/Vignesh send their action values, add their entity_type
-# keys and action lists here - nothing else in this file needs to
-# change for the validation below to start covering them too.
+# Note on naming: Vignesh's confirmed value (POLICY_DECISION_COMPLETED)
+# uses SCREAMING_SNAKE_CASE, unlike Muizz's dot-notation convention
+# (finding_instance.created). Kept exactly as given, since matching
+# what his code actually sends matters more than forcing a shared
+# convention retroactively - worth raising with the team if a
+# consistent format is wanted before more teams lock in their own.
+#
+# When Anafa sends her action values, add her entity_type key and
+# action list here - nothing else in this file needs to change for
+# the validation below to start covering her too.
 ACTIONS_BY_ENTITY: dict[str, set[str]] = {
     "finding_instance": {
         "finding_instance.created",
     },
     "dead_letter": {
         "dead_letter.created",
+    },
+    "priority_decision": {
+        "POLICY_DECISION_COMPLETED",
     },
 }
 
@@ -312,10 +322,10 @@ class AuditEvent(BaseModel):
         correctly-spelled action and gets confused by missing rows.
 
         entity_types not yet listed in ACTIONS_BY_ENTITY at all (e.g.
-        Anafa's/Vignesh's, before they send their lists) are allowed
-        through unchecked for now, so this doesn't block teams whose
-        action vocabulary hasn't been confirmed yet - only entity_types
-        that ARE listed get their action value checked against the list.
+        Anafa's, before she sends her list) are allowed through
+        unchecked for now, so this doesn't block teams whose action
+        vocabulary hasn't been confirmed yet - only entity_types that
+        ARE listed get their action value checked against the list.
         """
         allowed_actions = ACTIONS_BY_ENTITY.get(self.entity_type)
         if allowed_actions is not None and self.action not in allowed_actions:
