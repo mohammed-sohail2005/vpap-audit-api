@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-
+from threading import Lock
 import hashlib
 import requests
 
@@ -52,6 +52,7 @@ class KEVCatalogue:
     catalogue_sha256: str
     record_count: int
 _cached_catalogue: KEVCatalogue | None = None
+_kev_cache_lock = Lock()
 def clear_kev_cache() -> None:
     """
     Clear the in-memory KEV catalogue cache.
@@ -59,7 +60,6 @@ def clear_kev_cache() -> None:
     This is primarily used by tests so each test starts
     with a clean catalogue state.
     """
-
     global _cached_catalogue
 
     _cached_catalogue = None
@@ -319,7 +319,9 @@ def download_kev_catalogue() -> KEVResult:
     )
 
 
-def is_in_kev(cve_id: str) -> KEVResult:
+def is_in_kev(
+    cve_id: str,
+) -> tuple[KEVResult, KEVCatalogue | None]:
     """
     Check whether a CVE exists in the current CISA KEV catalogue.
 
@@ -333,69 +335,88 @@ def is_in_kev(cve_id: str) -> KEVResult:
 
     now = datetime.now(timezone.utc)
 
-    # ---------------------------------------------------------
-    # 1. Load catalogue if we don't have one yet
-    # ---------------------------------------------------------
+    with _kev_cache_lock:
+        # ---------------------------------------------------------
+        # 1. Load catalogue if we don't have one yet
+        # ---------------------------------------------------------
 
-    if _cached_catalogue is None:
+        if _cached_catalogue is None:
+            result = load_kev_catalogue()
 
-        result = load_kev_catalogue()
+            if result.status == "ERROR":
+                return result, None
 
-        if result.status == "ERROR":
-            return result
+            _cached_catalogue = KEVCatalogue(
+                cve_ids=result.cve_ids or set(),
+                source_timestamp=result.source_timestamp,
+                retrieved_at=result.retrieved_at,
+                catalogue_sha256=result.catalogue_sha256,
+                record_count=result.catalogue_record_count,
+            )
+            refreshed_catalogue = _cached_catalogue
+        else:
+            refreshed_catalogue = None
 
-        _cached_catalogue = KEVCatalogue(
-            cve_ids=result.cve_ids or set(),
-            source_timestamp=result.source_timestamp,
-            retrieved_at=result.retrieved_at,
-            catalogue_sha256=result.catalogue_sha256,
-            record_count=result.catalogue_record_count,
+        # ---------------------------------------------------------
+        # 2. Refresh catalogue if it is stale
+        # ---------------------------------------------------------
+
+        if is_catalogue_stale(
+            _cached_catalogue,
+            now,
+        ):
+            refreshed = load_kev_catalogue()
+
+            if refreshed.status == "FOUND":
+                _cached_catalogue = KEVCatalogue(
+                    cve_ids=refreshed.cve_ids or set(),
+                    source_timestamp=refreshed.source_timestamp,
+                    retrieved_at=refreshed.retrieved_at,
+                    catalogue_sha256=refreshed.catalogue_sha256,
+                    record_count=refreshed.catalogue_record_count,
+                )
+
+                refreshed_catalogue = _cached_catalogue
+
+            else:
+                return (
+                    KEVResult(
+                        status="STALE",
+                        value=None,
+                        reason_code="SOURCE_STALE",
+                        source_timestamp=_cached_catalogue.source_timestamp,
+                        retrieved_at=now,
+                        catalogue_sha256=_cached_catalogue.catalogue_sha256,
+                        catalogue_record_count=_cached_catalogue.record_count,
+                    ),
+                    None,
+                )
+
+        # ---------------------------------------------------------
+        # 3. Look up CVE in the cached catalogue
+        # ---------------------------------------------------------
+
+        if cve_id in _cached_catalogue.cve_ids:
+            return (
+                KEVResult(
+                    status="FOUND",
+                    value=True,
+                    source_timestamp=_cached_catalogue.source_timestamp,
+                    retrieved_at=now,
+                    catalogue_sha256=_cached_catalogue.catalogue_sha256,
+                    catalogue_record_count=_cached_catalogue.record_count,
+                ),
+                refreshed_catalogue,
+            )
+
+        return (
+            KEVResult(
+                status="NOT_FOUND",
+                value=False,
+                source_timestamp=_cached_catalogue.source_timestamp,
+                retrieved_at=now,
+                catalogue_sha256=_cached_catalogue.catalogue_sha256,
+                catalogue_record_count=_cached_catalogue.record_count,
+            ),
+            refreshed_catalogue,
         )
-
-    # ---------------------------------------------------------
-    # 2. Check catalogue freshness
-    # ---------------------------------------------------------
-    #
-    # POC limitation:
-    # The in-memory catalogue is downloaded once per process.
-    # A stale catalogue is reported but is not automatically refreshed.
-    # Production implementation must refresh stale data while preserving
-    # the last validated catalogue if the refresh fails.
-
-    if is_catalogue_stale(
-        _cached_catalogue,
-        now,
-    ):
-        return KEVResult(
-            status="STALE",
-            value=None,
-            reason_code="SOURCE_STALE",
-            source_timestamp=_cached_catalogue.source_timestamp,
-            retrieved_at=now,
-            catalogue_sha256=_cached_catalogue.catalogue_sha256,
-            catalogue_record_count=_cached_catalogue.record_count,
-        )
-
-    # ---------------------------------------------------------
-    # 3. Look up CVE in the cached catalogue
-    # ---------------------------------------------------------
-
-    if cve_id in _cached_catalogue.cve_ids:
-
-        return KEVResult(
-            status="FOUND",
-            value=True,
-            source_timestamp=_cached_catalogue.source_timestamp,
-            retrieved_at=now,
-            catalogue_sha256=_cached_catalogue.catalogue_sha256,
-            catalogue_record_count=_cached_catalogue.record_count,
-        )
-
-    return KEVResult(
-        status="NOT_FOUND",
-        value=False,
-        source_timestamp=_cached_catalogue.source_timestamp,
-        retrieved_at=now,
-        catalogue_sha256=_cached_catalogue.catalogue_sha256,
-        catalogue_record_count=_cached_catalogue.record_count,
-    )

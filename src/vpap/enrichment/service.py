@@ -4,8 +4,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 from vpap.domain.finding import Finding
-from vpap.enrichment.epss import get_epss
-from vpap.enrichment.kev import is_in_kev
+from vpap.enrichment.epss import EPSSResult, get_epss
+from vpap.enrichment.kev import KEVCatalogue, is_in_kev
 from vpap.enrichment.models import (
     CompensatingControl,
     EvidenceValue,
@@ -26,7 +26,6 @@ SOURCE_SYSTEM = "WIZ"
 
 # Synthetic POC values for now.
 # These will eventually come from the real tenant/configuration.
-DEFAULT_POC_TENANT_ID = "synthetic-tenant"
 DEFAULT_POC_SOURCE_INSTANCE_ID = "synthetic-wiz-instance"
 
 BUSINESS_CRITICALITY_MAPPING_VERSION = "business-tier-map-1.0"
@@ -112,10 +111,12 @@ def calculate_snapshot_sha256(
 
 def enrich_finding(
     finding: Finding,
+    tenant_id: str,
     enrichment_run_id: str | None = None,
-    tenant_id: str = DEFAULT_POC_TENANT_ID,
     source_instance_id: str = DEFAULT_POC_SOURCE_INSTANCE_ID,
-) -> FindingEvidence:
+    finding_instance_id: str | None = None,
+    epss_result: EPSSResult | None = None,
+) ->  tuple[FindingEvidence, KEVCatalogue | None]:
     """
     Enrich one canonical Finding with the evidence currently
     available to us.
@@ -145,7 +146,9 @@ def enrich_finding(
     # 1. Basic finding information
     # ---------------------------------------------------------
 
-    finding_instance_id = finding.source_finding_id
+    finding_instance_id = (
+        finding_instance_id or finding.source_finding_id
+    )
     cve_id = finding.cve_id
     asset_id = finding.asset_id
     cvss_base = finding.cvss_base
@@ -154,7 +157,8 @@ def enrich_finding(
     # 2. EPSS enrichment
     # ---------------------------------------------------------
 
-    epss_result = get_epss(cve_id)
+    if epss_result is None:
+        epss_result = get_epss(cve_id)
 
     if epss_result.status == "FOUND":
 
@@ -216,7 +220,7 @@ def enrich_finding(
     # 3. CISA KEV enrichment
     # ---------------------------------------------------------
 
-    kev_result = is_in_kev(cve_id)
+    kev_result, refreshed_catalogue = is_in_kev(cve_id)
 
     if kev_result.status == "FOUND":
 
@@ -401,32 +405,34 @@ def enrich_finding(
     # 10. Build final evidence object
     # ---------------------------------------------------------
 
-    return FindingEvidence(
-        # Provenance
-        schema_version=SCHEMA_VERSION,
-        tenant_id=tenant_id,
-        source_system=finding.source_system,
-        source_instance_id=source_instance_id,
-        source_finding_id=finding_instance_id,
-        adapter_name=ADAPTER_NAME,
-        adapter_version=ADAPTER_VERSION,
-        enrichment_run_id=enrichment_run_id,
-        evidence_snapshot_id=evidence_snapshot_id,
-        evidence_snapshot_sha256=evidence_snapshot_sha256,
+    return (
+        FindingEvidence(
+            # Provenance
+            schema_version=SCHEMA_VERSION,
+            tenant_id=tenant_id,
+            source_system=finding.source_system,
+            source_instance_id=source_instance_id,
+            source_finding_id=finding_instance_id,
+            adapter_name=ADAPTER_NAME,
+            adapter_version=ADAPTER_VERSION,
+            enrichment_run_id=enrichment_run_id,
+            evidence_snapshot_id=evidence_snapshot_id,
+            evidence_snapshot_sha256=evidence_snapshot_sha256,
 
-        # Finding
-        finding_instance_id=finding_instance_id,
-        cve_id=cve_id,
-        asset_id=asset_id,
-        cvss_base=cvss_base,
+            # Finding
+            finding_instance_id=finding_instance_id,
+            cve_id=cve_id,
+            asset_id=asset_id,
+            cvss_base=cvss_base,
 
-        # Evidence
-        epss_probability=epss_probability,
-        epss_percentile=epss_percentile,
-        kev_status=kev_status,
-        internet_exposure=internet_exposure,
-        runtime_applicability=runtime_applicability,
-        attack_path_reachable=attack_path_reachable,
-        business_criticality=business_criticality,
-        compensating_controls=compensating_controls,
+            # Evidence
+            epss_probability=epss_probability,
+            epss_percentile=epss_percentile,
+            kev_status=kev_status,
+            internet_exposure=internet_exposure,
+            runtime_applicability=runtime_applicability,
+            attack_path_reachable=attack_path_reachable,
+            business_criticality=business_criticality,
+            compensating_controls=compensating_controls,
+        ), refreshed_catalogue,
     )

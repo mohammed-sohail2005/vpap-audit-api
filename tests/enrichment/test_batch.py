@@ -41,8 +41,9 @@ def test_enriches_100_synthetic_findings() -> None:
         return_value=fake_epss_result,
     ):
         for finding in findings:
-            evidence = enrich_finding(
+            evidence,_ = enrich_finding(
                 finding,
+                tenant_id="test-tenant",
                 enrichment_run_id=enrichment_run_id,
             )
 

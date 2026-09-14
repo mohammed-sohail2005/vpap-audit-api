@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import pytest
-
+import logging
+import requests
 from vpap.domain.finding import Finding
 from vpap.domain.ingestion_result import IngestionResult
 from vpap.domain.rejected_record import RejectedRecord
@@ -13,16 +14,19 @@ from vpap.persistence.models import (
     DeadLetterCreate,
     FindingInstanceCreate,
     IngestionBatchCreate,
-    finding_to_persistence_model,
+    finding_to_persistence_model
 )
 from vpap.persistence.pipeline import PersistencePipeline
 from vpap.persistence.repositories import (
     DeadLetterRepository,
     FindingInstanceRepository,
     IngestionBatchRepository,
+    EnrichmentRunRepository,
+    FindingEvidenceRepository,
+    KEVCatalogueRepository,
 )
-
-
+from vpap.enrichment.models import EvidenceValue, FindingEvidence
+from vpap.enrichment.kev import KEVCatalogue
 # ============================================================================
 # Persistence Client Tests
 # ============================================================================
@@ -31,6 +35,7 @@ from vpap.persistence.repositories import (
 def test_post_sends_json_payload_and_returns_response():
     client = PersistenceClient(
         base_url="https://example.com/",
+        access_token="test-token",
         timeout=15.0,
     )
 
@@ -44,8 +49,9 @@ def test_post_sends_json_payload_and_returns_response():
         "id": "record-001",
     }
 
-    with patch(
-        "vpap.persistence.client.requests.post",
+    with patch.object(
+        client.session,
+        "post",
         return_value=response,
     ) as post:
         result = client._post("/test-endpoint", payload)
@@ -59,15 +65,124 @@ def test_post_sends_json_payload_and_returns_response():
     response.raise_for_status.assert_called_once_with()
     assert result == {"id": "record-001"}
 
+def test_client_requires_https():
+    with pytest.raises(ValueError, match="HTTPS"):
+        PersistenceClient(
+            "http://example.com",
+            access_token="test-token",
+        )
 
+
+def test_client_requires_access_token():
+    with pytest.raises(ValueError, match="access token"):
+        PersistenceClient(
+            "https://example.com",
+            access_token="",
+        )
+
+
+def test_client_sets_authentication_headers():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
+
+    assert client.session.headers["Authorization"] == "Bearer test-token"
+    assert client.session.headers["Content-Type"] == "application/json"
+def test_token_is_never_logged(caplog):
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="super-secret-token",
+    )
+
+    response = Mock()
+    response.status_code = 500
+    response.headers = {"X-Request-ID": "request-123"}
+    response.raise_for_status.side_effect = requests.HTTPError("HTTP 500")
+
+    with patch.object(
+        client.session,
+        "post",
+        return_value=response,
+    ):
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(requests.HTTPError):
+                client._post(
+                    "/test-endpoint",
+                    {"key": "value"},
+                )
+
+    assert "super-secret-token" not in caplog.text
+def test_401_is_not_retried():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
+
+    response = Mock()
+    response.status_code = 401
+    response.headers = {}
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "401 Unauthorized"
+    )
+
+    with patch.object(
+        client.session,
+        "post",
+        return_value=response,
+    ) as post:
+        with pytest.raises(requests.HTTPError):
+            client._post(
+                "/test-endpoint",
+                {"key": "value"},
+            )
+
+    post.assert_called_once()
+def test_403_is_not_retried():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
+
+    response = Mock()
+    response.status_code = 403
+    response.headers = {}
+    response.raise_for_status.side_effect = requests.HTTPError(
+        "403 Forbidden"
+    )
+
+    with patch.object(
+        client.session,
+        "post",
+        return_value=response,
+    ) as post:
+        with pytest.raises(requests.HTTPError):
+            client._post(
+                "/test-endpoint",
+                {"key": "value"},
+            )
+
+    post.assert_called_once()
+def test_auth_failures_are_not_in_retry_statuses():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
+
+    adapter = client.session.get_adapter("https://")
+    retry = adapter.max_retries
+
+    assert 401 not in retry.status_forcelist
+    assert 403 not in retry.status_forcelist
 def test_post_rejects_non_object_json_response():
-    client = PersistenceClient("https://example.com")
+    client = PersistenceClient("https://example.com", access_token="test-token")
 
     response = Mock()
     response.json.return_value = ["unexpected", "list"]
 
-    with patch(
-        "vpap.persistence.client.requests.post",
+    with patch.object(
+        client.session,
+        "post",
         return_value=response,
     ):
         with pytest.raises(
@@ -79,15 +194,15 @@ def test_post_rejects_non_object_json_response():
                 {"key": "value"},
             )
 
-
 def test_post_propagates_http_error():
-    client = PersistenceClient("https://example.com")
+    client = PersistenceClient("https://example.com", access_token="test-token")
 
     response = Mock()
     response.raise_for_status.side_effect = RuntimeError("HTTP failure")
 
-    with patch(
-        "vpap.persistence.client.requests.post",
+    with patch.object(
+        client.session,
+        "post",
         return_value=response,
     ):
         with pytest.raises(RuntimeError, match="HTTP failure"):
@@ -98,7 +213,7 @@ def test_post_propagates_http_error():
 
 
 def test_create_ingestion_batch_uses_correct_endpoint():
-    client = PersistenceClient("https://example.com")
+    client = PersistenceClient("https://example.com", access_token="test-token")
 
     payload = {"tenant_id": "tenant-001"}
 
@@ -115,9 +230,21 @@ def test_create_ingestion_batch_uses_correct_endpoint():
     )
     assert result == {"id": "batch-001"}
 
+def test_client_configures_safe_retries():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
 
+    adapter = client.session.get_adapter("https://")
+    retry = adapter.max_retries
+
+    assert retry.total == 3
+    assert retry.backoff_factor == 0.5
+    assert retry.status_forcelist == (429, 500, 502, 503, 504)
+    assert retry.allowed_methods == frozenset({"GET", "PATCH"})
 def test_create_finding_instance_uses_correct_endpoint():
-    client = PersistenceClient("https://example.com")
+    client = PersistenceClient("https://example.com", access_token="test-token")
 
     payload = {"tenant_id": "tenant-001"}
 
@@ -136,7 +263,7 @@ def test_create_finding_instance_uses_correct_endpoint():
 
 
 def test_create_dead_letter_uses_correct_endpoint():
-    client = PersistenceClient("https://example.com")
+    client = PersistenceClient("https://example.com", access_token="test-token")
 
     payload = {"tenant_id": "tenant-001"}
 
@@ -708,4 +835,239 @@ def test_dead_letter_repository_create():
 
     client.create_dead_letter.assert_called_once_with(
         dead_letter.model_dump(mode="json")
+    )
+def test_enrichment_run_repository_create():
+    client = Mock()
+    client.create_enrichment_run.return_value = {
+        "enrichment_run_id": "run-001",
+    }
+
+    repository = EnrichmentRunRepository(client)
+
+    payload = {
+        "tenant_id": "tenant-001",
+        "source_system": "WIZ",
+        "adapter_name": "wiz-enrichment",
+        "adapter_version": "1.0.0",
+        "schema_version": "4.1",
+        "started_at": "2026-09-05T10:00:00Z",
+        "status": "RUNNING",
+    }
+
+    result = repository.create(payload)
+
+    assert result == {"enrichment_run_id": "run-001"}
+
+    client.create_enrichment_run.assert_called_once_with(payload)
+
+
+def test_finding_evidence_repository_create():
+    client = Mock()
+    client.create_evidence.return_value = {
+        "evidence_id": "evidence-001",
+    }
+
+    repository = FindingEvidenceRepository(client)
+
+    evidence = FindingEvidence(
+        schema_version="4.1",
+        tenant_id="tenant-001",
+        source_system="WIZ",
+        source_instance_id="wiz-instance-001",
+        source_finding_id="wiz-001",
+        adapter_name="wiz-enrichment",
+        adapter_version="1.0.0",
+        enrichment_run_id="run-001",
+        evidence_snapshot_id="snapshot-001",
+        evidence_snapshot_sha256="abc123",
+        finding_instance_id="finding-001",
+        cve_id="CVE-2024-12345",
+        asset_id="asset-001",
+        cvss_base=8.5,
+        epss_probability=EvidenceValue(
+            value=0.75,
+            status="KNOWN",
+            source="FIRST_EPSS",
+            retrieved_at=datetime.now(),
+            confidence="HIGH",
+        ),
+        epss_percentile=EvidenceValue(
+            value=0.90,
+            status="KNOWN",
+            source="FIRST_EPSS",
+            retrieved_at=datetime.now(),
+            confidence="HIGH",
+        ),
+        kev_status=EvidenceValue(
+            value=False,
+            status="KNOWN",
+            source="CISA_KEV",
+            retrieved_at=datetime.now(),
+            confidence="HIGH",
+        ),
+        internet_exposure=EvidenceValue(
+            value=None,
+            status="UNKNOWN",
+            reason_code="NOT_QUERIED",
+            source="VPAP",
+            retrieved_at=datetime.now(),
+            confidence="LOW",
+        ),
+        runtime_applicability=EvidenceValue(
+            value=None,
+            status="UNKNOWN",
+            reason_code="NOT_QUERIED",
+            source="VPAP",
+            retrieved_at=datetime.now(),
+            confidence="LOW",
+        ),
+        attack_path_reachable=EvidenceValue(
+            value=None,
+            status="UNKNOWN",
+            reason_code="NOT_QUERIED",
+            source="VPAP",
+            retrieved_at=datetime.now(),
+            confidence="LOW",
+        ),
+        business_criticality=EvidenceValue(
+            value=None,
+            status="UNKNOWN",
+            reason_code="NOT_QUERIED",
+            source="VPAP",
+            retrieved_at=datetime.now(),
+            confidence="LOW",
+        ),
+        compensating_controls=EvidenceValue(
+            value=[],
+            status="UNKNOWN",
+            reason_code="NOT_QUERIED",
+            source="VPAP",
+            retrieved_at=datetime.now(),
+            confidence="LOW",
+        ),
+    )
+
+    result = repository.create(evidence)
+
+    assert result == {"evidence_id": "evidence-001"}
+
+    client.create_evidence.assert_called_once_with(
+        evidence.model_dump(mode="json")
+    )
+def test_create_enrichment_run_uses_correct_endpoint():
+    client = PersistenceClient("https://example.com", access_token="test-token")
+
+    payload = {
+        "tenant_id": "tenant-001",
+        "adapter_name": "wiz_enrichment_adapter",
+    }
+
+    with patch.object(
+        client,
+        "_post",
+        return_value={"id": "run-001"},
+    ) as post:
+        result = client.create_enrichment_run(payload)
+
+    post.assert_called_once_with(
+        "/enrichment-runs",
+        payload,
+    )
+    assert result == {"id": "run-001"}
+
+
+def test_create_evidence_uses_correct_endpoint():
+    client = PersistenceClient("https://example.com", access_token="test-token")
+
+    payload = {
+        "tenant_id": "tenant-001",
+        "finding_instance_id": "finding-001",
+    }
+
+    with patch.object(
+        client,
+        "_post",
+        return_value={"id": "evidence-001"},
+    ) as post:
+        result = client.create_evidence(payload)
+
+    post.assert_called_once_with(
+        "/evidence",
+        payload,
+    )
+    assert result == {"id": "evidence-001"}
+def test_kev_catalogue_repository_creates_catalogue_and_entries():
+    client = Mock()
+    client.create_kev_catalogue.return_value = {
+        "catalogue_id": "catalogue-001",
+    }
+
+    repository = KEVCatalogueRepository(client)
+
+    source_timestamp = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    cve_ids = {
+        "CVE-2024-00002",
+        "CVE-2024-00001",
+    }
+    catalogue = KEVCatalogue(
+        cve_ids=cve_ids,
+        source_timestamp=source_timestamp,
+        retrieved_at=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc),
+        catalogue_sha256="abc123",
+        record_count=2,
+    )
+
+    result = repository.create(catalogue)
+    client.create_kev_catalogue.assert_called_once_with(
+        {
+            "source_timestamp": "2026-08-28T00:00:00+00:00",
+            "catalogue_sha256": "abc123",
+            "record_count": 2,
+            "status": "OK",
+        }
+    )
+
+    client.create_kev_catalogue_entries.assert_called_once_with(
+        {
+            "entries": [
+                {
+                    "catalogue_id": "catalogue-001",
+                    "cve_id": "CVE-2024-00001",
+                },
+                {
+                    "catalogue_id": "catalogue-001",
+                    "cve_id": "CVE-2024-00002",
+                },
+            ]
+        }
+    )
+
+    assert result == {"catalogue_id": "catalogue-001"}
+def test_create_evidence_sends_idempotency_key():
+    client = PersistenceClient(
+        "https://example.com",
+        access_token="test-token",
+    )
+
+    payload = {
+        "tenant_id": "tenant-001",
+        "finding_instance_id": "finding-001",
+        "evidence_snapshot_sha256": "snapshot-hash-001",
+    }
+
+    with patch.object(
+        client.session,
+        "post",
+        return_value=Mock(
+            json=Mock(return_value={"id": "evidence-001"}),
+            raise_for_status=Mock(),
+        ),
+    ) as post:
+        client.create_evidence(payload)
+
+    post.assert_called_once_with(
+        "https://example.com/evidence",
+        json=payload,
+        timeout=10.0,
+        headers={"Idempotency-Key": "snapshot-hash-001"},
     )

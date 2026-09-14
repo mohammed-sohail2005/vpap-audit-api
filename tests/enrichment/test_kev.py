@@ -48,7 +48,7 @@ def test_cve_in_kev() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
     ):
-        result = is_in_kev("CVE-2024-00001")
+        result,_ = is_in_kev("CVE-2024-00001")
 
     assert result.status == "FOUND"
     assert result.value is True
@@ -65,7 +65,7 @@ def test_cve_not_in_kev() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
     ):
-        result = is_in_kev("CVE-2024-99999")
+        result,_ = is_in_kev("CVE-2024-99999")
 
     assert result.status == "NOT_FOUND"
     assert result.value is False
@@ -80,7 +80,7 @@ def test_kev_download_failure() -> None:
         "vpap.enrichment.kev.requests.get",
         side_effect=RequestException("network failure"),
     ):
-        result = is_in_kev("CVE-2024-00001")
+        result,_ = is_in_kev("CVE-2024-00001")
 
     assert result.status == "ERROR"
     assert result.value is None
@@ -102,7 +102,7 @@ def test_kev_malformed_json() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
     ):
-        result = is_in_kev("CVE-2024-00001")
+        result ,_= is_in_kev("CVE-2024-00001")
 
     assert result.status == "ERROR"
     assert result.reason_code == "INVALID_JSON"
@@ -132,7 +132,7 @@ def test_kev_duplicate_cves_are_rejected() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
     ):
-        result = is_in_kev("CVE-2024-00001")
+        result,_ = is_in_kev("CVE-2024-00001")
 
     assert result.status == "ERROR"
     assert result.reason_code == "DUPLICATE_CVE"
@@ -160,14 +160,13 @@ def test_kev_record_count_mismatch_is_rejected() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
     ):
-        result = is_in_kev("CVE-2024-00001")
+        result ,_= is_in_kev("CVE-2024-00001")
 
     assert result.status == "ERROR"
     assert result.reason_code == "RECORD_COUNT_MISMATCH"
-def test_stale_kev_catalogue_is_reported() -> None:
+def test_stale_kev_catalogue_is_refreshed() -> None:
     """
-    A catalogue older than the configured maximum age must
-    not be treated as fresh evidence.
+    A stale catalogue must be refreshed before it is used.
     """
 
     fake_response = make_fake_catalogue_response()
@@ -175,23 +174,23 @@ def test_stale_kev_catalogue_is_reported() -> None:
     with patch(
         "vpap.enrichment.kev.requests.get",
         return_value=fake_response,
-    ):
-        result = is_in_kev("CVE-2024-00001")
+    ) as mock_get:
+        result,_ = is_in_kev("CVE-2024-00001")
+
+        assert result.status == "FOUND"
+        assert mock_get.call_count == 1
+
+        # Make the cached catalogue artificially old.
+        kev._cached_catalogue.source_timestamp = (
+            datetime.now(timezone.utc)
+            - kev.KEV_MAX_AGE
+            - timedelta(seconds=1)
+        )
+
+        result,_ = is_in_kev("CVE-2024-00001")
 
     assert result.status == "FOUND"
-
-    # Make the cached catalogue artificially old.
-    kev._cached_catalogue.source_timestamp = (
-        datetime.now(timezone.utc)
-        - kev.KEV_MAX_AGE
-        - timedelta(seconds=1)
-    )
-
-    result = is_in_kev("CVE-2024-00001")
-
-    assert result.status == "STALE"
-    assert result.value is None
-    assert result.reason_code == "SOURCE_STALE"
+    assert mock_get.call_count == 2
 def test_last_known_good_catalogue_is_preserved_on_refresh_failure() -> None:
     """
     A valid catalogue must remain available when a later
@@ -205,7 +204,7 @@ def test_last_known_good_catalogue_is_preserved_on_refresh_failure() -> None:
         "vpap.enrichment.kev.requests.get",
         return_value=good_response,
     ):
-        first_result = is_in_kev("CVE-2024-00001")
+        first_result,_ = is_in_kev("CVE-2024-00001")
 
     assert first_result.status == "FOUND"
     assert first_result.value is True

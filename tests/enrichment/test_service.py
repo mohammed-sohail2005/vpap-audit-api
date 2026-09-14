@@ -33,10 +33,11 @@ def test_enrich_finding() -> None:
         return_value=fake_epss_result,
     ), patch(
         "vpap.enrichment.service.is_in_kev",
-        return_value=fake_kev_result,
+        return_value=(fake_kev_result, None),
     ):
-        evidence = enrich_finding(
+        evidence,_ = enrich_finding(
             finding,
+            tenant_id="test-tenant",
             enrichment_run_id=run_id,
         )
 
@@ -164,10 +165,11 @@ def test_service_maps_kev_not_found() -> None:
         return_value=fake_epss_result,
     ), patch(
         "vpap.enrichment.service.is_in_kev",
-        return_value=fake_kev_result,
+        return_value=(fake_kev_result, None),
     ):
-        evidence = enrich_finding(
+        evidence ,_= enrich_finding(
             finding,
+            tenant_id="test-tenant",
             enrichment_run_id="test-run-not-found",
         )
 
@@ -189,10 +191,11 @@ def test_service_maps_kev_stale() -> None:
         return_value=fake_epss_result,
     ), patch(
         "vpap.enrichment.service.is_in_kev",
-        return_value=fake_kev_result,
+        return_value=(fake_kev_result, None),
     ):
-        evidence = enrich_finding(
+        evidence,_ = enrich_finding(
             finding,
+            tenant_id="test-tenant",
             enrichment_run_id="test-run-stale",
         )
 
@@ -215,10 +218,11 @@ def test_service_maps_kev_error() -> None:
         return_value=fake_epss_result,
     ), patch(
         "vpap.enrichment.service.is_in_kev",
-        return_value=fake_kev_result,
+        return_value=(fake_kev_result, None),
     ):
-        evidence = enrich_finding(
+        evidence,_ = enrich_finding(
             finding,
+            tenant_id="test-tenant",
             enrichment_run_id="test-run-error",
         )
 
@@ -242,9 +246,9 @@ def test_service_accepts_custom_tenant_and_source_instance() -> None:
         return_value=fake_epss_result,
     ), patch(
         "vpap.enrichment.service.is_in_kev",
-        return_value=fake_kev_result,
+        return_value=(fake_kev_result, None),
     ):
-        evidence = enrich_finding(
+        evidence,_ = enrich_finding(
             finding,
             enrichment_run_id="test-custom-context",
             tenant_id="real-tenant-123",
