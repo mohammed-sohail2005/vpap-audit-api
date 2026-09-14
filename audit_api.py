@@ -37,7 +37,8 @@ Health:
     GET  /
 
 Auth:
-    POST /auth/vend-token
+    Tokens are issued out-of-band by a trusted operator using
+    generate_token.py. No public token endpoint is exposed.
 
 Muizz - Ingestion:
     POST /ingestion-batches
@@ -87,7 +88,6 @@ from psycopg.errors import UniqueViolation
 
 from auth import (
     issue_token,
-    authenticate_vending_credential,
     require_auth,
     require_tenant_match,
     AuthContext,
@@ -193,74 +193,6 @@ def health_check():
         "service": "vpap-audit-api",
         "version": "4.1.0",
     }
-
-
-# ============================================================
-# AUTHENTICATION / TOKEN VENDING
-# ============================================================
-
-class VendingTokenRequest(BaseModel):
-    """
-    Request a short-lived VPAP persistence token.
-
-    The client provides ONLY its vending credential.
-
-    The client does NOT provide:
-        tenant_id
-        subject
-        scope
-
-    Those values are determined by server-side configuration.
-    """
-
-    vending_credential: str = Field(
-        ...,
-        min_length=16,
-        description=(
-            "Private credential assigned to this service "
-            "for token vending."
-        ),
-    )
-
-
-@app.post("/auth/vend-token")
-def vend_token(
-    request: VendingTokenRequest,
-):
-    """
-    Secure token vending endpoint.
-
-    Flow:
-
-        vending credential
-                ↓
-        server-side lookup
-                ↓
-        subject + tenant + scope
-                ↓
-        issue_token()
-                ↓
-        short-lived JWT
-    """
-
-    identity = authenticate_vending_credential(
-        request.vending_credential
-    )
-
-    token_response = issue_token(
-        tenant_id=identity.tenant_id,
-        scope=identity.scope,
-        subject=identity.subject,
-    )
-
-    logger.info(
-        "Issued vending token: "
-        f"subject={identity.subject} "
-        f"tenant={identity.tenant_id} "
-        f"scope={identity.scope}"
-    )
-
-    return token_response
 
 
 # ============================================================

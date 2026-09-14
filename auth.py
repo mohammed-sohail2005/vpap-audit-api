@@ -2,7 +2,7 @@
 vpap_audit.auth
 -----------------
 
-Authentication and secure token vending for the VPAP Persistence API.
+Authentication for the VPAP Persistence API.
 
 Every protected API call must carry:
 
@@ -20,43 +20,26 @@ The JWT contains:
 AUTHENTICATION MODEL
 --------------------
 
-The VPAP API uses two different kinds of credentials:
-
-1. VPAP_AUTH_SECRET
+VPAP_AUTH_SECRET:
    - Server-side only.
    - Used to sign and verify JWTs.
    - NEVER distributed to teammates.
 
-2. Vending credentials
-   - One separate credential per service.
-   - Used only to request a short-lived JWT.
-   - Do NOT contain signing authority.
-   - The server determines tenant, subject and scope.
-
-Example:
-
-    Muizz credential
-        ->
-    ingestion-service
-        ->
-    vpap-pilot
-        ->
-    persistence:*
-
-The client cannot choose a different tenant or subject.
+Tokens are issued out-of-band by a trusted operator running
+generate_token.py locally. There is no public token-issuance
+endpoint.
 
 In a real production deployment:
 - VPAP_AUTH_SECRET would be replaced by a real IdP public key.
-- Tokens would come from a real identity provider.
+- Tokens would come from a real identity provider (e.g. Entra ID,
+  Okta) via OIDC/OAuth2 client credentials or workload identity.
 - Token validation would use the IdP's public key/JWKS.
 
-For the current POC, this module provides secure mock token
-issuance through the vending endpoint.
+For the current POC, this module validates JWTs issued
+out-of-band by generate_token.py.
 """
 
 import hashlib
-import hmac
-import json
 import os
 import time
 from typing import Optional
@@ -123,232 +106,6 @@ TOKEN_LIFETIME_SECONDS = 8 * 60 * 60  # 8 hours
 
 
 # ============================================================
-# VENDING CREDENTIAL CONFIGURATION
-# ============================================================
-
-"""
-Vending credentials are configured through:
-
-    VPAP_VENDING_CREDENTIALS
-
-The environment variable contains JSON.
-
-Example structure:
-
-[
-    {
-        "key_hash": "<sha256 hash>",
-        "subject": "ingestion-service",
-        "tenant_id": "vpap-pilot",
-        "scope": "persistence:*"
-    },
-    {
-        "key_hash": "<sha256 hash>",
-        "subject": "enrichment-service",
-        "tenant_id": "vpap-pilot",
-        "scope": "persistence:*"
-    },
-    {
-        "key_hash": "<sha256 hash>",
-        "subject": "policy-engine",
-        "tenant_id": "vpap-pilot",
-        "scope": "persistence:*"
-    }
-]
-
-IMPORTANT:
-
-Only SHA-256 hashes of vending credentials are stored on
-the server.
-
-The actual vending credentials are given to teammates once
-through a secure out-of-band channel.
-
-The server never needs to store the plaintext credential.
-"""
-
-
-class VendingIdentity:
-    """
-    Server-side identity associated with a vending credential.
-
-    The client does NOT provide these values.
-
-    They are determined entirely by the server.
-    """
-
-    def __init__(
-        self,
-        subject: str,
-        tenant_id: str,
-        scope: str,
-    ):
-        self.subject = subject
-        self.tenant_id = tenant_id
-        self.scope = scope
-
-
-def _load_vending_credentials() -> dict[str, VendingIdentity]:
-    """
-    Load vending credentials from the environment.
-
-    Returns:
-
-        {
-            sha256_hash: VendingIdentity(...)
-        }
-
-    If VPAP_VENDING_CREDENTIALS is not configured, vending is
-    unavailable.
-
-    This does NOT affect normal JWT validation.
-    """
-
-    raw = os.environ.get(
-        "VPAP_VENDING_CREDENTIALS"
-    )
-
-    if not raw:
-        return {}
-
-    try:
-        entries = json.loads(raw)
-
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "VPAP_VENDING_CREDENTIALS contains invalid JSON."
-        ) from exc
-
-    if not isinstance(entries, list):
-        raise RuntimeError(
-            "VPAP_VENDING_CREDENTIALS must contain a JSON list."
-        )
-
-    credentials: dict[str, VendingIdentity] = {}
-
-    for entry in entries:
-
-        if not isinstance(entry, dict):
-            raise RuntimeError(
-                "Each vending credential must be a JSON object."
-            )
-
-        key_hash = entry.get("key_hash")
-        subject = entry.get("subject")
-        tenant_id = entry.get("tenant_id")
-        scope = entry.get("scope")
-
-        if not all(
-            isinstance(value, str) and value.strip()
-            for value in (
-                key_hash,
-                subject,
-                tenant_id,
-                scope,
-            )
-        ):
-            raise RuntimeError(
-                "Each vending credential must contain "
-                "key_hash, subject, tenant_id and scope."
-            )
-
-        if len(key_hash) != 64:
-            raise RuntimeError(
-                "Vending credential key_hash must be "
-                "a SHA-256 hexadecimal hash."
-            )
-
-        key_hash = key_hash.lower()
-
-        if key_hash in credentials:
-            raise RuntimeError(
-                "Duplicate vending credential hash configured."
-            )
-
-        credentials[key_hash] = VendingIdentity(
-            subject=subject,
-            tenant_id=tenant_id,
-            scope=scope,
-        )
-
-    return credentials
-
-
-def _hash_vending_credential(
-    credential: str,
-) -> str:
-    """
-    Hash a plaintext vending credential.
-
-    The plaintext credential is never stored by this module.
-    """
-
-    return hashlib.sha256(
-        credential.encode("utf-8")
-    ).hexdigest()
-
-
-def authenticate_vending_credential(
-    credential: str,
-) -> VendingIdentity:
-    """
-    Validate a vending credential.
-
-    IMPORTANT:
-
-    The caller supplies only the credential.
-
-    The caller cannot supply:
-        tenant_id
-        subject
-        scope
-
-    Those values come from the server-side mapping.
-
-    Raises:
-        HTTP 503 if vending is not configured.
-        HTTP 401 if the credential is invalid.
-    """
-
-    if not credential:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing vending credential.",
-        )
-
-    credentials = _load_vending_credentials()
-
-    if not credentials:
-        raise HTTPException(
-            status_code=503,
-            detail="Token vending is not configured.",
-        )
-
-    presented_hash = _hash_vending_credential(
-        credential
-    )
-
-    identity = None
-
-    for stored_hash, configured_identity in credentials.items():
-
-        if hmac.compare_digest(
-            presented_hash,
-            stored_hash,
-        ):
-            identity = configured_identity
-            break
-
-    if identity is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid vending credential.",
-        )
-
-    return identity
-
-
-# ============================================================
 # TOKEN ISSUANCE
 # ============================================================
 
@@ -371,8 +128,8 @@ def issue_token(
     This function should only be called by trusted server-side
     code after identity has been established.
 
-    The vending endpoint calls this function only after looking
-    up the server-side vending credential.
+    This function is called by generate_token.py, run locally
+    by a trusted operator.
     """
 
     now = int(time.time())
