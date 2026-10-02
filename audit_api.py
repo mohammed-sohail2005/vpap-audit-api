@@ -143,6 +143,10 @@ logger = logging.getLogger(
 # FASTAPI APPLICATION
 # ============================================================
 
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
+
 app = FastAPI(
     title="VPAP Audit & Data API",
     description=(
@@ -152,6 +156,24 @@ app = FastAPI(
     ),
     version="4.1.0",
 )
+
+# CORS middleware for frontend UI integration
+# CORS middleware for frontend UI integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+frontend_dist = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.exists(frontend_dist):
+    app.mount("/ui", StaticFiles(directory=frontend_dist, html=True), name="ui")
+
 
 
 audit_client = AuditClient()
