@@ -1909,236 +1909,337 @@ class AuditClient:
     # FINDING HISTORY
     # ========================================================
 
-    def get_finding_history(
-        self,
-        finding_id: str,
-        tenant_id: str,
-    ) -> dict:
-        """
-        Full reconstructed story of one finding.
+    # ========================================================
+# FINDING HISTORY
+# ========================================================
 
-        finding_id is the external/source finding ID
-        (for example: wiz-vf-000002).
+def get_finding_history(
+    self,
+    finding_id: str,
+    tenant_id: str,
+) -> dict:
+    """
+    Full reconstructed story of one finding.
 
-        Tenant filtering is mandatory to prevent cross-tenant
-        data exposure.
-        """
+    Parameters
+    ----------
+    finding_id:
+        External/source finding ID supplied by the frontend,
+        for example: "wiz-vf-000002".
 
-        with self._connect() as conn:
+    tenant_id:
+        Tenant from the authenticated token.
 
-            with conn.cursor(
-                row_factory=psycopg.rows.dict_row
-            ) as cur:
+    Important ID mapping
+    --------------------
+    finding_instance.source_finding_id
+        -> external/source finding ID
 
-                # ------------------------------------------------
-                # FINDING
-                # ------------------------------------------------
-                # The frontend/API sends source_finding_id,
-                # not the internal UUID primary key.
+    finding_instance.id
+        -> internal PostgreSQL UUID
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.finding_instance
+    Tables such as priority_decision, human_decision,
+    exception_record, finding_evidence and ticket_link
+    reference the internal finding_instance.id UUID.
 
-                    WHERE source_finding_id =
-                        %(finding_id)s
+    audit_event.correlation_id uses the external/source
+    finding ID so that all events can be correlated with
+    the frontend/API finding ID.
 
-                    AND tenant_id =
-                        %(tenant_id)s
+    Tenant filtering is mandatory on every query to prevent
+    cross-tenant data exposure.
+    """
 
-                    LIMIT 1
-                    """,
-                    {
-                        "finding_id": finding_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+    with self._connect() as conn:
 
-                finding = cur.fetchone()
+        with conn.cursor(
+            row_factory=psycopg.rows.dict_row
+        ) as cur:
 
-                if finding is None:
-                    return {
-                        "finding": None,
-                        "evidence": [],
-                        "decisions": [],
-                        "human_decisions": [],
-                        "exceptions": [],
-                        "tickets": [],
-                        "audit_trail": [],
-                    }
+            # ------------------------------------------------
+            # 1. FINDING
+            # ------------------------------------------------
+            #
+            # The frontend sends the external/source finding ID.
+            #
+            # Example:
+            #     wiz-vf-000002
+            #
+            # This is NOT the PostgreSQL UUID.
+            # Therefore we first resolve the external ID to
+            # the internal finding_instance.id.
+            # ------------------------------------------------
 
-                # Internal PostgreSQL UUID.
-                # This is required by tables that reference
-                # finding_instance.id.
-                finding_instance_id = str(finding["id"])
+            cur.execute(
+                """
+                SELECT *
+                FROM public.finding_instance
 
-                # ------------------------------------------------
-                # FINDING EVIDENCE
-                # ------------------------------------------------
+                WHERE source_finding_id =
+                    %(finding_id)s
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.finding_evidence
+                AND tenant_id =
+                    %(tenant_id)s
 
-                    WHERE finding_instance_id =
-                        %(finding_instance_id)s
+                LIMIT 1
+                """,
+                {
+                    "finding_id": finding_id,
+                    "tenant_id": tenant_id,
+                },
+            )
 
-                    AND tenant_id =
-                        %(tenant_id)s
+            finding = cur.fetchone()
 
-                    ORDER BY created_at ASC
-                    """,
-                    {
-                        "finding_instance_id": finding_instance_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+            # ------------------------------------------------
+            # Finding does not exist for this tenant
+            # ------------------------------------------------
 
-                evidence = cur.fetchall()
+            if finding is None:
+                return {
+                    "finding": None,
+                    "evidence": [],
+                    "decisions": [],
+                    "human_decisions": [],
+                    "exceptions": [],
+                    "tickets": [],
+                    "audit_trail": [],
+                }
 
-                # ------------------------------------------------
-                # PRIORITY DECISIONS
-                # ------------------------------------------------
-                # priority_decision.finding_id stores the
-                # external/source finding ID.
+            # ------------------------------------------------
+            # Resolve internal PostgreSQL UUID
+            # ------------------------------------------------
+            #
+            # finding["id"] is the UUID primary key of
+            # finding_instance.
+            #
+            # This value must be used when querying tables
+            # whose finding reference is UUID.
+            # ------------------------------------------------
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.priority_decision
+            finding_instance_id = str(
+                finding["id"]
+            )
 
-                    WHERE finding_id =
-                        %(finding_id)s
+            # ------------------------------------------------
+            # 2. FINDING EVIDENCE
+            # ------------------------------------------------
+            #
+            # finding_evidence.finding_instance_id
+            # references finding_instance.id.
+            # Therefore use the internal UUID.
+            # ------------------------------------------------
 
-                    AND tenant_id =
-                        %(tenant_id)s
+            cur.execute(
+                """
+                SELECT *
+                FROM public.finding_evidence
 
-                    ORDER BY created_at ASC
-                    """,
-                    {
-                        "finding_id": finding_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+                WHERE finding_instance_id =
+                    %(finding_instance_id)s
 
-                decisions = cur.fetchall()
+                AND tenant_id =
+                    %(tenant_id)s
 
-                # ------------------------------------------------
-                # HUMAN DECISIONS
-                # ------------------------------------------------
-                # human_decision.finding_instance_id stores
-                # the internal UUID.
+                ORDER BY created_at ASC
+                """,
+                {
+                    "finding_instance_id":
+                        finding_instance_id,
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.human_decision
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
 
-                    WHERE finding_instance_id =
-                        %(finding_instance_id)s
+            evidence = cur.fetchall()
 
-                    AND tenant_id =
-                        %(tenant_id)s
+            # ------------------------------------------------
+            # 3. PRIORITY DECISIONS
+            # ------------------------------------------------
+            #
+            # IMPORTANT:
+            # priority_decision.finding_id is UUID and
+            # references finding_instance.id.
+            #
+            # Therefore DO NOT use:
+            #
+            #     finding_id = "wiz-vf-000002"
+            #
+            # Use the resolved internal UUID instead.
+            # ------------------------------------------------
 
-                    ORDER BY created_at ASC
-                    """,
-                    {
-                        "finding_instance_id": finding_instance_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+            cur.execute(
+                """
+                SELECT *
+                FROM public.priority_decision
 
-                human_decisions = cur.fetchall()
+                WHERE finding_id =
+                    %(finding_instance_id)s
 
-                # ------------------------------------------------
-                # EXCEPTIONS
-                # ------------------------------------------------
-                # exception_record.finding_id stores the
-                # external/source finding ID.
+                AND tenant_id =
+                    %(tenant_id)s
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.exception_record
+                ORDER BY created_at ASC
+                """,
+                {
+                    "finding_instance_id":
+                        finding_instance_id,
 
-                    WHERE finding_id =
-                        %(finding_id)s
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
 
-                    AND tenant_id =
-                        %(tenant_id)s
+            decisions = cur.fetchall()
 
-                    ORDER BY created_at ASC
-                    """,
-                    {
-                        "finding_id": finding_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+            # ------------------------------------------------
+            # 4. HUMAN DECISIONS
+            # ------------------------------------------------
+            #
+            # human_decision.finding_instance_id is UUID.
+            # Therefore use the internal UUID.
+            # ------------------------------------------------
 
-                exceptions = cur.fetchall()
+            cur.execute(
+                """
+                SELECT *
+                FROM public.human_decision
 
-                # ------------------------------------------------
-                # TICKET LINKS
-                # ------------------------------------------------
-                # ticket_link.finding_instance_id stores
-                # the internal UUID.
+                WHERE finding_instance_id =
+                    %(finding_instance_id)s
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.ticket_link
+                AND tenant_id =
+                    %(tenant_id)s
 
-                    WHERE finding_instance_id =
-                        %(finding_instance_id)s
+                ORDER BY created_at ASC
+                """,
+                {
+                    "finding_instance_id":
+                        finding_instance_id,
 
-                    AND tenant_id =
-                        %(tenant_id)s
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
 
-                    ORDER BY created_at ASC
-                    """,
-                    {
-                        "finding_instance_id": finding_instance_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+            human_decisions = cur.fetchall()
 
-                tickets = cur.fetchall()
+            # ------------------------------------------------
+            # 5. EXCEPTIONS
+            # ------------------------------------------------
+            #
+            # IMPORTANT:
+            # exception_record.finding_id is UUID and
+            # references finding_instance.id.
+            #
+            # Therefore use the internal UUID.
+            # ------------------------------------------------
 
-                # ------------------------------------------------
-                # AUDIT TRAIL
-                # ------------------------------------------------
-                # audit_event.correlation_id stores the
-                # external/source finding ID.
+            cur.execute(
+                """
+                SELECT *
+                FROM public.exception_record
 
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM public.audit_event
+                WHERE finding_id =
+                    %(finding_instance_id)s
 
-                    WHERE correlation_id =
-                        %(finding_id)s
+                AND tenant_id =
+                    %(tenant_id)s
 
-                    AND tenant_id =
-                        %(tenant_id)s
+                ORDER BY created_at ASC
+                """,
+                {
+                    "finding_instance_id":
+                        finding_instance_id,
 
-                    ORDER BY occurred_at ASC
-                    """,
-                    {
-                        "finding_id": finding_id,
-                        "tenant_id": tenant_id,
-                    },
-                )
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
 
-                audit_trail = cur.fetchall()
+            exceptions = cur.fetchall()
 
-        return {
-            "finding": finding,
-            "evidence": evidence,
-            "decisions": decisions,
-            "human_decisions": human_decisions,
-            "exceptions": exceptions,
-            "tickets": tickets,
-            "audit_trail": audit_trail,
-        }
+            # ------------------------------------------------
+            # 6. TICKET LINKS
+            # ------------------------------------------------
+            #
+            # ticket_link.finding_instance_id is UUID.
+            # Therefore use the internal UUID.
+            # ------------------------------------------------
+
+            cur.execute(
+                """
+                SELECT *
+                FROM public.ticket_link
+
+                WHERE finding_instance_id =
+                    %(finding_instance_id)s
+
+                AND tenant_id =
+                    %(tenant_id)s
+
+                ORDER BY created_at ASC
+                """,
+                {
+                    "finding_instance_id":
+                        finding_instance_id,
+
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
+
+            tickets = cur.fetchall()
+
+            # ------------------------------------------------
+            # 7. AUDIT TRAIL
+            # ------------------------------------------------
+            #
+            # audit_event.correlation_id stores the
+            # external/source finding ID.
+            #
+            # Example:
+            #     wiz-vf-000002
+            #
+            # Therefore use the original finding_id here,
+            # NOT finding_instance_id.
+            # ------------------------------------------------
+
+            cur.execute(
+                """
+                SELECT *
+                FROM public.audit_event
+
+                WHERE correlation_id =
+                    %(finding_id)s
+
+                AND tenant_id =
+                    %(tenant_id)s
+
+                ORDER BY occurred_at ASC
+                """,
+                {
+                    "finding_id":
+                        finding_id,
+
+                    "tenant_id":
+                        tenant_id,
+                },
+            )
+
+            audit_trail = cur.fetchall()
+
+    # --------------------------------------------------------
+    # Return reconstructed finding history
+    # --------------------------------------------------------
+
+    return {
+        "finding": finding,
+        "evidence": evidence,
+        "decisions": decisions,
+        "human_decisions": human_decisions,
+        "exceptions": exceptions,
+        "tickets": tickets,
+        "audit_trail": audit_trail,
+    }
