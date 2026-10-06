@@ -1909,337 +1909,337 @@ class AuditClient:
     # FINDING HISTORY
     # ========================================================
 
-    # ========================================================
+# ========================================================
 # FINDING HISTORY
 # ========================================================
 
-def get_finding_history(
-    self,
-    finding_id: str,
-    tenant_id: str,
-) -> dict:
-    """
-    Full reconstructed story of one finding.
+    def get_finding_history(
+        self,
+        finding_id: str,
+        tenant_id: str,
+    ) -> dict:
+        """
+        Full reconstructed story of one finding.
 
-    Parameters
-    ----------
-    finding_id:
-        External/source finding ID supplied by the frontend,
-        for example: "wiz-vf-000002".
+        Parameters
+        ----------
+        finding_id:
+            External/source finding ID supplied by the frontend,
+            for example: "wiz-vf-000002".
 
-    tenant_id:
-        Tenant from the authenticated token.
+        tenant_id:
+            Tenant from the authenticated token.
 
-    Important ID mapping
-    --------------------
-    finding_instance.source_finding_id
-        -> external/source finding ID
+        Important ID mapping
+        --------------------
+        finding_instance.source_finding_id
+            -> external/source finding ID
 
-    finding_instance.id
-        -> internal PostgreSQL UUID
+        finding_instance.id
+            -> internal PostgreSQL UUID
 
-    Tables such as priority_decision, human_decision,
-    exception_record, finding_evidence and ticket_link
-    reference the internal finding_instance.id UUID.
+        Tables such as priority_decision, human_decision,
+        exception_record, finding_evidence and ticket_link
+        reference the internal finding_instance.id UUID.
 
-    audit_event.correlation_id uses the external/source
-    finding ID so that all events can be correlated with
-    the frontend/API finding ID.
+        audit_event.correlation_id uses the external/source
+        finding ID so that all events can be correlated with
+        the frontend/API finding ID.
 
-    Tenant filtering is mandatory on every query to prevent
-    cross-tenant data exposure.
-    """
+        Tenant filtering is mandatory on every query to prevent
+        cross-tenant data exposure.
+        """
 
-    with self._connect() as conn:
+        with self._connect() as conn:
 
-        with conn.cursor(
-            row_factory=psycopg.rows.dict_row
-        ) as cur:
+            with conn.cursor(
+                row_factory=psycopg.rows.dict_row
+            ) as cur:
 
-            # ------------------------------------------------
-            # 1. FINDING
-            # ------------------------------------------------
-            #
-            # The frontend sends the external/source finding ID.
-            #
-            # Example:
-            #     wiz-vf-000002
-            #
-            # This is NOT the PostgreSQL UUID.
-            # Therefore we first resolve the external ID to
-            # the internal finding_instance.id.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 1. FINDING
+                # ------------------------------------------------
+                #
+                # The frontend sends the external/source finding ID.
+                #
+                # Example:
+                #     wiz-vf-000002
+                #
+                # This is NOT the PostgreSQL UUID.
+                # Therefore we first resolve the external ID to
+                # the internal finding_instance.id.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.finding_instance
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.finding_instance
 
-                WHERE source_finding_id =
-                    %(finding_id)s
+                    WHERE source_finding_id =
+                        %(finding_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                LIMIT 1
-                """,
-                {
-                    "finding_id": finding_id,
-                    "tenant_id": tenant_id,
-                },
-            )
+                    LIMIT 1
+                    """,
+                    {
+                        "finding_id": finding_id,
+                        "tenant_id": tenant_id,
+                    },
+                )
 
-            finding = cur.fetchone()
+                finding = cur.fetchone()
 
-            # ------------------------------------------------
-            # Finding does not exist for this tenant
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # Finding does not exist for this tenant
+                # ------------------------------------------------
 
-            if finding is None:
-                return {
-                    "finding": None,
-                    "evidence": [],
-                    "decisions": [],
-                    "human_decisions": [],
-                    "exceptions": [],
-                    "tickets": [],
-                    "audit_trail": [],
-                }
+                if finding is None:
+                    return {
+                        "finding": None,
+                        "evidence": [],
+                        "decisions": [],
+                        "human_decisions": [],
+                        "exceptions": [],
+                        "tickets": [],
+                        "audit_trail": [],
+                    }
 
-            # ------------------------------------------------
-            # Resolve internal PostgreSQL UUID
-            # ------------------------------------------------
-            #
-            # finding["id"] is the UUID primary key of
-            # finding_instance.
-            #
-            # This value must be used when querying tables
-            # whose finding reference is UUID.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # Resolve internal PostgreSQL UUID
+                # ------------------------------------------------
+                #
+                # finding["id"] is the UUID primary key of
+                # finding_instance.
+                #
+                # This value must be used when querying tables
+                # whose finding reference is UUID.
+                # ------------------------------------------------
 
-            finding_instance_id = str(
-                finding["id"]
-            )
+                finding_instance_id = str(
+                    finding["id"]
+                )
 
-            # ------------------------------------------------
-            # 2. FINDING EVIDENCE
-            # ------------------------------------------------
-            #
-            # finding_evidence.finding_instance_id
-            # references finding_instance.id.
-            # Therefore use the internal UUID.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 2. FINDING EVIDENCE
+                # ------------------------------------------------
+                #
+                # finding_evidence.finding_instance_id
+                # references finding_instance.id.
+                # Therefore use the internal UUID.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.finding_evidence
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.finding_evidence
 
-                WHERE finding_instance_id =
-                    %(finding_instance_id)s
+                    WHERE finding_instance_id =
+                        %(finding_instance_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY created_at ASC
-                """,
-                {
-                    "finding_instance_id":
-                        finding_instance_id,
+                    ORDER BY created_at ASC
+                    """,
+                    {
+                        "finding_instance_id":
+                            finding_instance_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            evidence = cur.fetchall()
+                evidence = cur.fetchall()
 
-            # ------------------------------------------------
-            # 3. PRIORITY DECISIONS
-            # ------------------------------------------------
-            #
-            # IMPORTANT:
-            # priority_decision.finding_id is UUID and
-            # references finding_instance.id.
-            #
-            # Therefore DO NOT use:
-            #
-            #     finding_id = "wiz-vf-000002"
-            #
-            # Use the resolved internal UUID instead.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 3. PRIORITY DECISIONS
+                # ------------------------------------------------
+                #
+                # IMPORTANT:
+                # priority_decision.finding_id is UUID and
+                # references finding_instance.id.
+                #
+                # Therefore DO NOT use:
+                #
+                #     finding_id = "wiz-vf-000002"
+                #
+                # Use the resolved internal UUID instead.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.priority_decision
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.priority_decision
 
-                WHERE finding_id =
-                    %(finding_instance_id)s
+                    WHERE finding_id =
+                        %(finding_instance_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY created_at ASC
-                """,
-                {
-                    "finding_instance_id":
-                        finding_instance_id,
+                    ORDER BY created_at ASC
+                    """,
+                    {
+                        "finding_instance_id":
+                            finding_instance_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            decisions = cur.fetchall()
+                decisions = cur.fetchall()
 
-            # ------------------------------------------------
-            # 4. HUMAN DECISIONS
-            # ------------------------------------------------
-            #
-            # human_decision.finding_instance_id is UUID.
-            # Therefore use the internal UUID.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 4. HUMAN DECISIONS
+                # ------------------------------------------------
+                #
+                # human_decision.finding_instance_id is UUID.
+                # Therefore use the internal UUID.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.human_decision
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.human_decision
 
-                WHERE finding_instance_id =
-                    %(finding_instance_id)s
+                    WHERE finding_instance_id =
+                        %(finding_instance_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY created_at ASC
-                """,
-                {
-                    "finding_instance_id":
-                        finding_instance_id,
+                    ORDER BY created_at ASC
+                    """,
+                    {
+                        "finding_instance_id":
+                            finding_instance_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            human_decisions = cur.fetchall()
+                human_decisions = cur.fetchall()
 
-            # ------------------------------------------------
-            # 5. EXCEPTIONS
-            # ------------------------------------------------
-            #
-            # IMPORTANT:
-            # exception_record.finding_id is UUID and
-            # references finding_instance.id.
-            #
-            # Therefore use the internal UUID.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 5. EXCEPTIONS
+                # ------------------------------------------------
+                #
+                # IMPORTANT:
+                # exception_record.finding_id is UUID and
+                # references finding_instance.id.
+                #
+                # Therefore use the internal UUID.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.exception_record
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.exception_record
 
-                WHERE finding_id =
-                    %(finding_instance_id)s
+                    WHERE finding_id =
+                        %(finding_instance_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY created_at ASC
-                """,
-                {
-                    "finding_instance_id":
-                        finding_instance_id,
+                    ORDER BY created_at ASC
+                    """,
+                    {
+                        "finding_instance_id":
+                            finding_instance_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            exceptions = cur.fetchall()
+                exceptions = cur.fetchall()
 
-            # ------------------------------------------------
-            # 6. TICKET LINKS
-            # ------------------------------------------------
-            #
-            # ticket_link.finding_instance_id is UUID.
-            # Therefore use the internal UUID.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 6. TICKET LINKS
+                # ------------------------------------------------
+                #
+                # ticket_link.finding_instance_id is UUID.
+                # Therefore use the internal UUID.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.ticket_link
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.ticket_link
 
-                WHERE finding_instance_id =
-                    %(finding_instance_id)s
+                    WHERE finding_instance_id =
+                        %(finding_instance_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY created_at ASC
-                """,
-                {
-                    "finding_instance_id":
-                        finding_instance_id,
+                    ORDER BY created_at ASC
+                    """,
+                    {
+                        "finding_instance_id":
+                            finding_instance_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            tickets = cur.fetchall()
+                tickets = cur.fetchall()
 
-            # ------------------------------------------------
-            # 7. AUDIT TRAIL
-            # ------------------------------------------------
-            #
-            # audit_event.correlation_id stores the
-            # external/source finding ID.
-            #
-            # Example:
-            #     wiz-vf-000002
-            #
-            # Therefore use the original finding_id here,
-            # NOT finding_instance_id.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # 7. AUDIT TRAIL
+                # ------------------------------------------------
+                #
+                # audit_event.correlation_id stores the
+                # external/source finding ID.
+                #
+                # Example:
+                #     wiz-vf-000002
+                #
+                # Therefore use the original finding_id here,
+                # NOT finding_instance_id.
+                # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM public.audit_event
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.audit_event
 
-                WHERE correlation_id =
-                    %(finding_id)s
+                    WHERE correlation_id =
+                        %(finding_id)s
 
-                AND tenant_id =
-                    %(tenant_id)s
+                    AND tenant_id =
+                        %(tenant_id)s
 
-                ORDER BY occurred_at ASC
-                """,
-                {
-                    "finding_id":
-                        finding_id,
+                    ORDER BY occurred_at ASC
+                    """,
+                    {
+                        "finding_id":
+                            finding_id,
 
-                    "tenant_id":
-                        tenant_id,
-                },
-            )
+                        "tenant_id":
+                            tenant_id,
+                    },
+                )
 
-            audit_trail = cur.fetchall()
+                audit_trail = cur.fetchall()
 
-    # --------------------------------------------------------
-    # Return reconstructed finding history
-    # --------------------------------------------------------
+        # --------------------------------------------------------
+        # Return reconstructed finding history
+        # --------------------------------------------------------
 
-    return {
-        "finding": finding,
-        "evidence": evidence,
-        "decisions": decisions,
-        "human_decisions": human_decisions,
-        "exceptions": exceptions,
-        "tickets": tickets,
-        "audit_trail": audit_trail,
-    }
+        return {
+            "finding": finding,
+            "evidence": evidence,
+            "decisions": decisions,
+            "human_decisions": human_decisions,
+            "exceptions": exceptions,
+            "tickets": tickets,
+            "audit_trail": audit_trail,
+        }
