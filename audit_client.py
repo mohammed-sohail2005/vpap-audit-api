@@ -1917,8 +1917,11 @@ class AuditClient:
         """
         Full reconstructed story of one finding.
 
-        Every tenant-owned query is restricted to the authenticated
-        tenant. This prevents cross-tenant data exposure.
+        finding_id is the external/source finding ID
+        (for example: wiz-vf-000002).
+
+        Tenant filtering is mandatory to prevent cross-tenant
+        data exposure.
         """
 
         with self._connect() as conn:
@@ -1930,31 +1933,31 @@ class AuditClient:
                 # ------------------------------------------------
                 # FINDING
                 # ------------------------------------------------
+                # The frontend/API sends source_finding_id,
+                # not the internal UUID primary key.
 
                 cur.execute(
                     """
                     SELECT *
                     FROM public.finding_instance
 
-                    WHERE id =
-                        %(id)s
+                    WHERE source_finding_id =
+                        %(finding_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
+
+                    LIMIT 1
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_id": finding_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
                 finding = cur.fetchone()
 
                 if finding is None:
-
                     return {
                         "finding": None,
                         "evidence": [],
@@ -1964,6 +1967,11 @@ class AuditClient:
                         "tickets": [],
                         "audit_trail": [],
                     }
+
+                # Internal PostgreSQL UUID.
+                # This is required by tables that reference
+                # finding_instance.id.
+                finding_instance_id = str(finding["id"])
 
                 # ------------------------------------------------
                 # FINDING EVIDENCE
@@ -1975,7 +1983,7 @@ class AuditClient:
                     FROM public.finding_evidence
 
                     WHERE finding_instance_id =
-                        %(id)s
+                        %(finding_instance_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -1983,11 +1991,8 @@ class AuditClient:
                     ORDER BY created_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_instance_id": finding_instance_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
@@ -1996,6 +2001,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # PRIORITY DECISIONS
                 # ------------------------------------------------
+                # priority_decision.finding_id stores the
+                # external/source finding ID.
 
                 cur.execute(
                     """
@@ -2003,7 +2010,7 @@ class AuditClient:
                     FROM public.priority_decision
 
                     WHERE finding_id =
-                        %(id)s
+                        %(finding_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2011,11 +2018,8 @@ class AuditClient:
                     ORDER BY created_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_id": finding_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
@@ -2024,6 +2028,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # HUMAN DECISIONS
                 # ------------------------------------------------
+                # human_decision.finding_instance_id stores
+                # the internal UUID.
 
                 cur.execute(
                     """
@@ -2031,7 +2037,7 @@ class AuditClient:
                     FROM public.human_decision
 
                     WHERE finding_instance_id =
-                        %(id)s
+                        %(finding_instance_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2039,11 +2045,8 @@ class AuditClient:
                     ORDER BY created_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_instance_id": finding_instance_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
@@ -2052,6 +2055,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # EXCEPTIONS
                 # ------------------------------------------------
+                # exception_record.finding_id stores the
+                # external/source finding ID.
 
                 cur.execute(
                     """
@@ -2059,7 +2064,7 @@ class AuditClient:
                     FROM public.exception_record
 
                     WHERE finding_id =
-                        %(id)s
+                        %(finding_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2067,11 +2072,8 @@ class AuditClient:
                     ORDER BY created_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_id": finding_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
@@ -2080,6 +2082,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # TICKET LINKS
                 # ------------------------------------------------
+                # ticket_link.finding_instance_id stores
+                # the internal UUID.
 
                 cur.execute(
                     """
@@ -2087,7 +2091,7 @@ class AuditClient:
                     FROM public.ticket_link
 
                     WHERE finding_instance_id =
-                        %(id)s
+                        %(finding_instance_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2095,11 +2099,8 @@ class AuditClient:
                     ORDER BY created_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_instance_id": finding_instance_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
@@ -2108,6 +2109,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # AUDIT TRAIL
                 # ------------------------------------------------
+                # audit_event.correlation_id stores the
+                # external/source finding ID.
 
                 cur.execute(
                     """
@@ -2115,7 +2118,7 @@ class AuditClient:
                     FROM public.audit_event
 
                     WHERE correlation_id =
-                        %(id)s
+                        %(finding_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2123,11 +2126,8 @@ class AuditClient:
                     ORDER BY occurred_at ASC
                     """,
                     {
-                        "id":
-                            finding_id,
-
-                        "tenant_id":
-                            tenant_id,
+                        "finding_id": finding_id,
+                        "tenant_id": tenant_id,
                     },
                 )
 
