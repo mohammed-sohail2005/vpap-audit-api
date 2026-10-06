@@ -2195,16 +2195,8 @@ class AuditClient:
                 # ------------------------------------------------
                 # 7. AUDIT TRAIL
                 # ------------------------------------------------
-                #
-                # audit_event.correlation_id stores the
-                # external/source finding ID.
-                #
-                # Example:
-                #     wiz-vf-000002
-                #
-                # Therefore use the original finding_id here,
-                # NOT finding_instance_id.
-                # ------------------------------------------------
+                # audit_event.correlation_id stores the internal
+                # finding_instance.id UUID.
 
                 cur.execute(
                     """
@@ -2212,7 +2204,7 @@ class AuditClient:
                     FROM public.audit_event
 
                     WHERE correlation_id =
-                        %(finding_id)s
+                        %(finding_instance_id)s
 
                     AND tenant_id =
                         %(tenant_id)s
@@ -2220,8 +2212,8 @@ class AuditClient:
                     ORDER BY occurred_at ASC
                     """,
                     {
-                        "finding_id":
-                            finding_id,
+                        "finding_instance_id":
+                            finding_instance_id,
 
                         "tenant_id":
                             tenant_id,
