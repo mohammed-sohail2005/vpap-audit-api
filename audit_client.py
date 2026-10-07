@@ -144,6 +144,7 @@ class DeadLetter(BaseModel):
 
     batch_id: Optional[str] = None
     source_finding_id: Optional[str] = None
+    record_type: Optional[str] = None
 
     stage: Literal[
         "INGESTION",
@@ -157,6 +158,34 @@ class DeadLetter(BaseModel):
 
     status: str = "OPEN"
     retry_count: int = 0
+
+
+# ============================================================
+# ACS - ASSET CONTEXT SOURCE
+# ============================================================
+
+class AssetContext(BaseModel):
+    tenant_id: str
+    idempotency_key: str
+    source_system: str = "ACS"
+    asset_id: str
+
+    hostname: Optional[str] = None
+    ip_address: Optional[str] = None
+    asset_type: Optional[str] = None
+    platform_os: Optional[str] = None
+    environment: Optional[str] = None
+    business_unit: Optional[str] = None
+    business_criticality: Optional[str] = None
+    owner_team: Optional[str] = None
+    internet_exposed: Optional[bool] = None
+    location_zone: Optional[str] = None
+
+    software_inventory: list = Field(default_factory=list)
+
+    lifecycle_state: Optional[str] = None
+    data_classification: Optional[str] = None
+    status: Optional[str] = None
 
 
 # ============================================================
@@ -815,19 +844,24 @@ class AuditClient:
         entry: DeadLetter,
     ) -> str:
 
+        raw_data = entry.raw_record.copy() if entry.raw_record else {}
+        if entry.record_type:
+            raw_data["record_type"] = entry.record_type
+
         payload = entry.model_dump(
-            exclude={"raw_record"}
+            exclude={"raw_record", "record_type"}
         )
 
         payload["raw_record"] = (
-            Json(entry.raw_record)
-            if entry.raw_record
+            Json(raw_data)
+            if raw_data
             else None
         )
 
-        cols = list(
-            DeadLetter.model_fields.keys()
-        )
+        cols = [
+            k for k in DeadLetter.model_fields.keys()
+            if k != "record_type"
+        ]
 
         return self._insert_returning(
             "public.dead_letter",
@@ -835,6 +869,150 @@ class AuditClient:
             payload,
             "id",
         )
+
+    # ========================================================
+    # ACS - ASSET CONTEXT SOURCE
+    # ========================================================
+
+    def upsert_asset_context(
+        self,
+        asset: AssetContext,
+    ) -> dict:
+        """
+        Idempotent AssetContext upsert based on (tenant_id, idempotency_key).
+        Returns dict: {"id": str(asset_uuid), "status": "CREATED" | "UPDATED", "asset_id": asset.asset_id}
+        """
+        software_json = Json(asset.software_inventory) if asset.software_inventory is not None else Json([])
+
+        with self._connect() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.asset_contexts (
+                        tenant_id,
+                        idempotency_key,
+                        source_system,
+                        asset_id,
+                        hostname,
+                        ip_address,
+                        asset_type,
+                        platform_os,
+                        environment,
+                        business_unit,
+                        business_criticality,
+                        owner_team,
+                        internet_exposed,
+                        location_zone,
+                        software_inventory,
+                        lifecycle_state,
+                        data_classification,
+                        status
+                    ) VALUES (
+                        %(tenant_id)s,
+                        %(idempotency_key)s,
+                        %(source_system)s,
+                        %(asset_id)s,
+                        %(hostname)s,
+                        %(ip_address)s,
+                        %(asset_type)s,
+                        %(platform_os)s,
+                        %(environment)s,
+                        %(business_unit)s,
+                        %(business_criticality)s,
+                        %(owner_team)s,
+                        %(internet_exposed)s,
+                        %(location_zone)s,
+                        %(software_inventory)s,
+                        %(lifecycle_state)s,
+                        %(data_classification)s,
+                        %(status)s
+                    )
+                    ON CONFLICT (tenant_id, idempotency_key)
+                    DO UPDATE SET
+                        source_system = EXCLUDED.source_system,
+                        asset_id = EXCLUDED.asset_id,
+                        hostname = EXCLUDED.hostname,
+                        ip_address = EXCLUDED.ip_address,
+                        asset_type = EXCLUDED.asset_type,
+                        platform_os = EXCLUDED.platform_os,
+                        environment = EXCLUDED.environment,
+                        business_unit = EXCLUDED.business_unit,
+                        business_criticality = EXCLUDED.business_criticality,
+                        owner_team = EXCLUDED.owner_team,
+                        internet_exposed = EXCLUDED.internet_exposed,
+                        location_zone = EXCLUDED.location_zone,
+                        software_inventory = EXCLUDED.software_inventory,
+                        lifecycle_state = EXCLUDED.lifecycle_state,
+                        data_classification = EXCLUDED.data_classification,
+                        status = EXCLUDED.status,
+                        updated_at = NOW()
+                    RETURNING id, (xmax = 0) AS is_created, asset_id;
+                    """,
+                    {
+                        "tenant_id": asset.tenant_id,
+                        "idempotency_key": asset.idempotency_key,
+                        "source_system": asset.source_system or "ACS",
+                        "asset_id": asset.asset_id,
+                        "hostname": asset.hostname,
+                        "ip_address": asset.ip_address,
+                        "asset_type": asset.asset_type,
+                        "platform_os": asset.platform_os,
+                        "environment": asset.environment,
+                        "business_unit": asset.business_unit,
+                        "business_criticality": asset.business_criticality,
+                        "owner_team": asset.owner_team,
+                        "internet_exposed": asset.internet_exposed,
+                        "location_zone": asset.location_zone,
+                        "software_inventory": software_json,
+                        "lifecycle_state": asset.lifecycle_state,
+                        "data_classification": asset.data_classification,
+                        "status": asset.status,
+                    },
+                )
+                row = cur.fetchone()
+                conn.commit()
+
+                return {
+                    "id": str(row["id"]),
+                    "status": "CREATED" if row["is_created"] else "UPDATED",
+                    "asset_id": row["asset_id"],
+                }
+
+    def get_asset_context(
+        self,
+        tenant_id: str,
+        asset_id: str,
+    ) -> Optional[dict]:
+        """
+        Tenant-scoped AssetContext retrieval by asset_id.
+        """
+        with self._connect() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM public.asset_contexts
+                    WHERE tenant_id = %(tenant_id)s
+                      AND asset_id = %(asset_id)s
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """,
+                    {
+                        "tenant_id": tenant_id,
+                        "asset_id": asset_id,
+                    },
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                row["id"] = str(row["id"])
+                if isinstance(row.get("created_at"), datetime):
+                    row["created_at"] = row["created_at"].isoformat()
+                if isinstance(row.get("updated_at"), datetime):
+                    row["updated_at"] = row["updated_at"].isoformat()
+
+                return row
 
     # ========================================================
     # ANAFA - ENRICHMENT RUN

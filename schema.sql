@@ -429,6 +429,41 @@ CREATE INDEX IF NOT EXISTS idx_audit_action      ON audit_event (action);
 
 
 -- ============================================================
+-- ACS - Asset Context Source
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS public.asset_contexts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id TEXT NOT NULL,
+    idempotency_key VARCHAR(64) NOT NULL,
+    source_system TEXT NOT NULL DEFAULT 'ACS',
+    asset_id TEXT NOT NULL,
+    hostname TEXT,
+    ip_address TEXT,
+    asset_type TEXT,
+    platform_os TEXT,
+    environment TEXT,
+    business_unit TEXT,
+    business_criticality TEXT,
+    owner_team TEXT,
+    internet_exposed BOOLEAN,
+    location_zone TEXT,
+    software_inventory JSONB NOT NULL DEFAULT '[]'::jsonb,
+    lifecycle_state TEXT,
+    data_classification TEXT,
+    status TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT asset_contexts_tenant_idempotency_unique
+        UNIQUE (tenant_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_contexts_tenant_asset
+    ON public.asset_contexts (tenant_id, asset_id);
+
+
+-- ============================================================
 -- Access control
 -- ============================================================
 
@@ -445,8 +480,10 @@ GRANT SELECT, INSERT, UPDATE ON
     enrichment_run, finding_evidence, kev_catalogue, kev_catalogue_entry,
     epss_snapshot, epss_snapshot_entry,
     public.policy_version, public.priority_decision, public.human_decision,
-    public.exception_record, public.outbox_event, public.ticket_link
+    public.exception_record, public.outbox_event, public.ticket_link,
+    public.asset_contexts
     TO vpap_app;
 
 GRANT INSERT, SELECT ON audit_event TO vpap_app;
 REVOKE UPDATE, DELETE ON audit_event FROM vpap_app;
+

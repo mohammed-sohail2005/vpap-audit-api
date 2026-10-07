@@ -100,6 +100,7 @@ from audit_client import (
     IngestionBatch,
     FindingInstance,
     DeadLetter,
+    AssetContext,
 
     # Enrichment
     EvidenceValue,
@@ -375,6 +376,7 @@ class DeadLetterRequest(BaseModel):
 
     batch_id: Optional[str] = None
     source_finding_id: Optional[str] = None
+    record_type: Optional[str] = None
 
     stage: Literal[
         "INGESTION",
@@ -431,6 +433,110 @@ def create_dead_letter(
             status_code=500,
             detail="Failed to record dead letter.",
         )
+
+
+# ============================================================
+# ACS - ASSET CONTEXT SOURCE ENDPOINTS
+# ============================================================
+
+class AssetContextRequest(BaseModel):
+    tenant_id: str
+    idempotency_key: str
+    source_system: str = "ACS"
+    asset_id: str
+
+    hostname: Optional[str] = None
+    ip_address: Optional[str] = None
+    asset_type: Optional[str] = None
+    platform_os: Optional[str] = None
+    environment: Optional[str] = None
+    business_unit: Optional[str] = None
+    business_criticality: Optional[str] = None
+    owner_team: Optional[str] = None
+    internet_exposed: Optional[bool] = None
+    location_zone: Optional[str] = None
+
+    software_inventory: list = Field(default_factory=list)
+
+    lifecycle_state: Optional[str] = None
+    data_classification: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.post("/asset-contexts")
+def create_asset_context(
+    body: AssetContextRequest,
+    auth: AuthContext = Depends(require_auth),
+):
+    """
+    Action: asset_context.create
+    Idempotent creation or update of an AssetContext record based on (tenant_id, idempotency_key).
+    Returns {"id": "<asset_uuid>", "status": "CREATED" | "UPDATED", "asset_id": "<asset_id>"}.
+    """
+    require_tenant_match(
+        auth,
+        body.tenant_id,
+    )
+
+    try:
+        result = audit_client.upsert_asset_context(
+            AssetContext(
+                **body.model_dump()
+            )
+        )
+
+        logger.info(
+            f"Upserted asset context: "
+            f"id={result['id']} "
+            f"status={result['status']} "
+            f"asset_id={body.asset_id} "
+            f"tenant={auth.tenant_id} "
+            f"by={auth.subject}"
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to upsert asset context: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to record asset context.",
+        )
+
+
+@app.get("/asset-contexts/{asset_id}")
+def get_asset_context(
+    asset_id: str,
+    auth: AuthContext = Depends(require_auth),
+):
+    """
+    Action: asset_context.get
+    Retrieve the AssetContext associated with the given asset_id.
+    Strictly scoped to the authenticated tenant.
+    """
+    try:
+        res = audit_client.get_asset_context(
+            tenant_id=auth.tenant_id,
+            asset_id=asset_id,
+        )
+
+        if not res:
+            raise HTTPException(
+                status_code=404,
+                detail="AssetContext not found.",
+            )
+
+        return res
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch asset context: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch asset context.",
+        )
+
 
 
 # ============================================================

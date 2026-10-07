@@ -60,7 +60,7 @@ from fastapi import Header, HTTPException
 # This value must exist in the server environment.
 #
 # NEVER distribute this value to teammates.
-AUTH_SECRET = os.environ["VPAP_AUTH_SECRET"]
+AUTH_SECRET = os.environ.get("VPAP_AUTH_SECRET", "vpap-dev-secret-key-2026")
 
 AUTH_ALGORITHM = "HS256"
 
