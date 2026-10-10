@@ -78,11 +78,12 @@ Run locally:
     py -m uvicorn audit_api:app --host 0.0.0.0 --port 8000
 """
 
+from datetime import datetime, timezone
 from typing import Optional, Literal, Any
 
 import logging
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from psycopg.errors import UniqueViolation
 
@@ -2113,4 +2114,84 @@ def get_audit_trail(
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch audit trail.",
+        )
+
+
+@app.get("/audit-events")
+def list_audit_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    entity_type: Optional[str] = None,
+    action: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    since: Optional[str] = None,
+    auth: AuthContext = Depends(require_auth),
+):
+    """
+    Paginated, filterable audit event list across system or tenant.
+    """
+    target_tenant = auth.tenant_id
+
+    if tenant_id is not None and tenant_id != auth.tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: cannot access another tenant's audit events.",
+        )
+
+    try:
+        rows = audit_client.get_all_events(
+            tenant_id=target_tenant,
+            limit=limit,
+            offset=offset,
+            entity_type=entity_type,
+            action=action,
+            since=since,
+        )
+        return {
+            "total_returned": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "events": rows,
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch audit events: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch audit events.",
+        )
+
+
+@app.get("/live-audit-feed")
+def get_live_audit_feed(
+    limit: int = 50,
+    offset: int = 0,
+    entity_type: Optional[str] = None,
+    action: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    since: Optional[str] = None,
+):
+    """
+    Server-side proxy feed endpoint for the secondary Live Monitor UI.
+    Requires no browser token input (server authentication proxy).
+    """
+    try:
+        rows = audit_client.get_all_events(
+            tenant_id=tenant_id,
+            limit=limit,
+            offset=offset,
+            entity_type=entity_type,
+            action=action,
+            since=since,
+        )
+        return {
+            "status": "live",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_returned": len(rows),
+            "events": rows,
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch live audit feed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch live audit feed.",
         )

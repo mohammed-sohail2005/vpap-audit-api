@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import uuid
 
 from datetime import datetime
 from typing import Optional, Literal, Generic, TypeVar, Any
@@ -2081,7 +2082,68 @@ class AuditClient:
                     },
                 )
 
-                return cur.fetchall()
+                rows = cur.fetchall()
+                for r in rows:
+                    if isinstance(r.get("id"), uuid.UUID):
+                        r["id"] = str(r["id"])
+                    if isinstance(r.get("occurred_at"), datetime):
+                        r["occurred_at"] = r["occurred_at"].isoformat()
+                return rows
+
+    def get_all_events(
+        self,
+        tenant_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        entity_type: Optional[str] = None,
+        action: Optional[str] = None,
+        since: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        System-wide or tenant-filtered audit event stream, newest first.
+        """
+        where_clauses = []
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+
+        if tenant_id:
+            where_clauses.append("tenant_id = %(tenant_id)s")
+            params["tenant_id"] = tenant_id
+
+        if entity_type:
+            where_clauses.append("entity_type = %(entity_type)s")
+            params["entity_type"] = entity_type
+
+        if action:
+            where_clauses.append("action = %(action)s")
+            params["action"] = action
+
+        if since:
+            where_clauses.append("occurred_at > %(since)s")
+            params["since"] = since
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        with self._connect() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM public.audit_event
+                    {where_sql}
+                    ORDER BY occurred_at DESC, id DESC
+                    LIMIT %(limit)s OFFSET %(offset)s
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+
+                for row in rows:
+                    if isinstance(row.get("id"), uuid.UUID):
+                        row["id"] = str(row["id"])
+                    if isinstance(row.get("occurred_at"), datetime):
+                        row["occurred_at"] = row["occurred_at"].isoformat()
+
+                return rows
 
     # ========================================================
     # FINDING HISTORY
