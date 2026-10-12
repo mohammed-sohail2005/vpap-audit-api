@@ -2,14 +2,15 @@
 vpap_audit.audit_client
 ------------------------
 
-Shared database client for VPAP 4.1, covering all confirmed tables:
+Shared database client and persistence models for VPAP 4.1:
 
-    Muizz (ingestion):
+    Ingestion:
         ingestion_batch
         finding_instance
         dead_letter
+        asset_contexts
 
-    Anafa (enrichment):
+    Enrichment:
         enrichment_run
         finding_evidence
         kev_catalogue
@@ -17,7 +18,7 @@ Shared database client for VPAP 4.1, covering all confirmed tables:
         epss_snapshot
         epss_snapshot_entry
 
-    Vignesh (policy):
+    Policy Engine:
         policy_version
         priority_decision
         human_decision
@@ -25,14 +26,11 @@ Shared database client for VPAP 4.1, covering all confirmed tables:
         outbox_event
         ticket_link
 
-    Sohail (audit):
+    Audit Trail:
         audit_event
 
-Every pipeline stage imports this ONE module, or calls the equivalent
-endpoint on audit_api.py.
-
-The API layer wraps these methods behind HTTP so teammates do not need
-direct database credentials.
+Provides centralized PostgreSQL persistence, connection management,
+and data models across platform components.
 """
 
 from __future__ import annotations
@@ -80,7 +78,7 @@ T = TypeVar("T")
 
 
 # ============================================================
-# MUIZZ - INGESTION & VALIDATION
+# INGESTION & VALIDATION
 # ============================================================
 
 class IngestionBatch(BaseModel):
@@ -190,7 +188,7 @@ class AssetContext(BaseModel):
 
 
 # ============================================================
-# ANAFA - ENRICHMENT
+# ENRICHMENT
 # ============================================================
 
 class EvidenceValue(BaseModel, Generic[T]):
@@ -318,7 +316,7 @@ class EpssSnapshotEntry(BaseModel):
 
 
 # ============================================================
-# VIGNESH - POLICY ENGINE
+# POLICY ENGINE
 # ============================================================
 
 class PolicyVersion(BaseModel):
@@ -482,7 +480,7 @@ class TicketLink(BaseModel):
 
 
 # ============================================================
-# SOHAIL - AUDIT ACTION VOCABULARY
+# AUDIT ACTION VOCABULARY
 # ============================================================
 
 """
@@ -491,14 +489,14 @@ Exact action values used by the audit trail.
 These values are validated by AuditEvent and audit_api.py.
 
 ------------------------------------------------------------
-MUIZZ - INGESTION
+INGESTION
 ------------------------------------------------------------
 
 finding_instance.created
 dead_letter.created
 
 ------------------------------------------------------------
-ANAFA - ENRICHMENT
+ENRICHMENT
 ------------------------------------------------------------
 
 enrichment_run.started
@@ -508,7 +506,7 @@ enrichment_run.failed
 finding_evidence.recorded
 
 ------------------------------------------------------------
-VIGNESH - POLICY ENGINE
+POLICY ENGINE
 ------------------------------------------------------------
 
 priority_decision.completed
@@ -533,7 +531,7 @@ ticket_link.created
 ACTIONS_BY_ENTITY: dict[str, set[str]] = {
 
     # --------------------------------------------------------
-    # MUIZZ - INGESTION
+    # INGESTION
     # --------------------------------------------------------
 
     "finding_instance": {
@@ -545,7 +543,7 @@ ACTIONS_BY_ENTITY: dict[str, set[str]] = {
     },
 
     # --------------------------------------------------------
-    # ANAFA - ENRICHMENT
+    # ENRICHMENT
     # --------------------------------------------------------
 
     "enrichment_run": {
@@ -579,7 +577,7 @@ ACTIONS_BY_ENTITY: dict[str, set[str]] = {
     },
 
     # --------------------------------------------------------
-    # VIGNESH - POLICY ENGINE
+    # POLICY ENGINE
     # --------------------------------------------------------
 
     "priority_decision": {
@@ -737,7 +735,7 @@ class AuditClient:
         return str(row[0])
 
     # ========================================================
-    # MUIZZ - INGESTION BATCH
+    # INGESTION BATCH
     # ========================================================
 
     def log_ingestion_batch(
@@ -757,7 +755,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # MUIZZ - FINDING INSTANCE
+    # FINDING INSTANCE
     # ========================================================
 
     def upsert_finding(
@@ -837,7 +835,7 @@ class AuditClient:
         return str(row[0])
 
     # ========================================================
-    # MUIZZ - DEAD LETTER
+    # DEAD LETTER
     # ========================================================
 
     def log_dead_letter(
@@ -1016,7 +1014,7 @@ class AuditClient:
                 return row
 
     # ========================================================
-    # ANAFA - ENRICHMENT RUN
+    # ENRICHMENT RUN
     # ========================================================
 
     def log_enrichment_run(
@@ -1114,7 +1112,7 @@ class AuditClient:
         return str(row[0])
 
     # ========================================================
-    # ANAFA - FINDING EVIDENCE
+    # FINDING EVIDENCE
     # ========================================================
 
     def log_finding_evidence(
@@ -1266,7 +1264,7 @@ class AuditClient:
         return str(row[0])
 
     # ========================================================
-    # ANAFA - KEV CATALOGUE
+    # KEV CATALOGUE
     # ========================================================
 
     def log_kev_catalogue(
@@ -1286,7 +1284,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # ANAFA - KEV CATALOGUE ENTRIES
+    # KEV CATALOGUE ENTRIES
     # ========================================================
 
     def log_kev_catalogue_entries(
@@ -1334,7 +1332,7 @@ class AuditClient:
         return count
 
     # ========================================================
-    # ANAFA - EPSS SNAPSHOT
+    # EPSS SNAPSHOT
     # ========================================================
 
     def log_epss_snapshot(
@@ -1354,7 +1352,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # ANAFA - EPSS SNAPSHOT ENTRIES
+    # EPSS SNAPSHOT ENTRIES
     # ========================================================
 
     def log_epss_snapshot_entries(
@@ -1406,7 +1404,7 @@ class AuditClient:
         return count
 
     # ========================================================
-    # ANAFA - LATEST EPSS VALUES
+    # LATEST EPSS VALUES
     # ========================================================
 
     def get_latest_epss_values(
@@ -1456,7 +1454,7 @@ class AuditClient:
                 return cur.fetchall()
 
     # ========================================================
-    # VIGNESH - POLICY VERSION
+    # POLICY VERSION
     # ========================================================
 
     def log_policy_version(
@@ -1502,7 +1500,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # VIGNESH - PRIORITY DECISION
+    # PRIORITY DECISION
     # ========================================================
 
     def log_decision(
@@ -1541,7 +1539,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # VIGNESH - HUMAN DECISION
+    # HUMAN DECISION
     # ========================================================
 
     def log_human_decision(
@@ -1613,7 +1611,7 @@ class AuditClient:
                 return cur.fetchall()
 
     # ========================================================
-    # VIGNESH - EXCEPTION RECORD
+    # EXCEPTION RECORD
     # ========================================================
 
     def log_exception(
@@ -1775,7 +1773,7 @@ class AuditClient:
         return row
 
     # ========================================================
-    # VIGNESH - OUTBOX EVENT
+    # OUTBOX EVENT
     # ========================================================
 
     def log_outbox_event(
@@ -1942,7 +1940,7 @@ class AuditClient:
         return row
 
     # ========================================================
-    # VIGNESH - TICKET LINK
+    # TICKET LINK
     # ========================================================
 
     def log_ticket_link(
@@ -1962,7 +1960,7 @@ class AuditClient:
         )
 
     # ========================================================
-    # SOHAIL - AUDIT EVENT
+    # AUDIT EVENT
     # ========================================================
 
     def log(

@@ -2,13 +2,8 @@
 VPAP 4.1 - Full Data & Audit API, with Authentication
 ------------------------------------------------------
 
-One REST endpoint per table, so Muizz, Anafa, Vignesh, and Sohail
-never need direct database credentials.
-
-Everyone calls this API.
-
-This service is the only component holding the real Supabase
-connection string.
+Centralized REST service for vulnerability prioritization, enrichment,
+policy evaluation, and immutable audit logging.
 
 AUTHENTICATION
 --------------
@@ -36,17 +31,15 @@ ENDPOINTS
 Health:
     GET  /
 
-Auth:
-    Tokens are issued out-of-band by a trusted operator using
-    generate_token.py. No public token endpoint is exposed.
-
-Muizz - Ingestion:
+Ingestion Pipeline:
     POST /ingestion-batches
     POST /findings
     POST /dead-letters
     GET  /findings/{finding_id}/history
+    POST /asset-contexts
+    GET  /asset-contexts/{asset_id}
 
-Anafa - Enrichment:
+Enrichment Service:
     POST  /enrichment-runs
     PATCH /enrichment-runs/{enrichment_run_id}
     POST  /evidence
@@ -56,7 +49,7 @@ Anafa - Enrichment:
     POST  /epss-snapshot-entries
     GET   /epss-snapshot-entries/latest
 
-Vignesh - Policy Engine:
+Policy Engine:
     POST  /policy-versions
     POST  /decisions
     POST  /human-decisions
@@ -69,9 +62,11 @@ Vignesh - Policy Engine:
     PATCH /outbox-events/{outbox_event_id}
     POST  /ticket-links
 
-Sohail - Audit:
+Audit Service:
     POST /audit-events
+    GET  /audit-events
     GET  /audit-events/{correlation_id}
+    GET  /live-audit-feed
 
 Run locally:
 
@@ -220,7 +215,7 @@ def health_check():
 
 
 # ============================================================
-# MUIZZ - INGESTION & VALIDATION
+# INGESTION & VALIDATION
 # ============================================================
 
 class IngestionBatchRequest(BaseModel):
@@ -587,7 +582,7 @@ def get_finding_history(
 
 
 # ============================================================
-# ANAFA - ENRICHMENT
+# ENRICHMENT PIPELINE
 # ============================================================
 
 class EvidenceValueRequest(BaseModel):
@@ -1125,7 +1120,7 @@ def get_latest_epss_values(
 
 
 # ============================================================
-# VIGNESH - POLICY ENGINE
+# POLICY ENGINE
 # ============================================================
 
 # ============================================================
@@ -1963,7 +1958,7 @@ def create_ticket_link(
 
 
 # ============================================================
-# SOHAIL - AUDIT
+# AUDIT TRAIL SERVICE
 # ============================================================
 
 class AuditEventRequest(BaseModel):
