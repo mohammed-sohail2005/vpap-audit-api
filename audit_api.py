@@ -481,6 +481,33 @@ def create_asset_context(
             )
         )
 
+        # Record immutable audit event for live telemetry feed
+        action = "asset_context.created" if result["status"] == "CREATED" else "asset_context.updated"
+        try:
+            audit_client.log(
+                DBAuditEvent(
+                    tenant_id=auth.tenant_id,
+                    actor_type="system",
+                    actor_id=auth.subject or "acs-adapter",
+                    action=action,
+                    entity_type="asset_context",
+                    entity_id=body.asset_id,
+                    correlation_id=body.asset_id,
+                    after_state={
+                        "hostname": body.hostname,
+                        "ip_address": body.ip_address,
+                        "asset_type": body.asset_type,
+                        "platform_os": body.platform_os,
+                        "environment": body.environment,
+                        "business_criticality": body.business_criticality,
+                        "owner_team": body.owner_team,
+                        "internet_exposed": body.internet_exposed,
+                    },
+                )
+            )
+        except Exception as audit_err:
+            logger.warning(f"Could not write audit_event for asset_context: {audit_err}")
+
         logger.info(
             f"Upserted asset context: "
             f"id={result['id']} "

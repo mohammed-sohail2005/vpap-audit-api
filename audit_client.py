@@ -542,6 +542,11 @@ ACTIONS_BY_ENTITY: dict[str, set[str]] = {
         "dead_letter.created",
     },
 
+    "asset_context": {
+        "asset_context.created",
+        "asset_context.updated",
+    },
+
     # --------------------------------------------------------
     # ENRICHMENT
     # --------------------------------------------------------
@@ -2213,12 +2218,16 @@ class AuditClient:
                     SELECT *
                     FROM public.finding_instance
 
-                    WHERE source_finding_id =
-                        %(finding_id)s
+                    WHERE (
+                        source_finding_id = %(finding_id)s
+                        OR id::text = %(finding_id)s
+                        OR cve_id = %(finding_id)s
+                    )
 
                     AND tenant_id =
                         %(tenant_id)s
 
+                    ORDER BY created_at DESC
                     LIMIT 1
                     """,
                     {
@@ -2236,6 +2245,7 @@ class AuditClient:
                 if finding is None:
                     return {
                         "finding": None,
+                        "asset_context": None,
                         "evidence": [],
                         "decisions": [],
                         "human_decisions": [],
@@ -2461,11 +2471,22 @@ class AuditClient:
                 audit_trail = cur.fetchall()
 
         # --------------------------------------------------------
+        # 8. ASSET CONTEXT (ACS)
+        # --------------------------------------------------------
+        asset_context = None
+        if finding and finding.get("asset_id"):
+            asset_context = self.get_asset_context(
+                tenant_id=tenant_id,
+                asset_id=finding["asset_id"],
+            )
+
+        # --------------------------------------------------------
         # Return reconstructed finding history
         # --------------------------------------------------------
 
         return {
             "finding": finding,
+            "asset_context": asset_context,
             "evidence": evidence,
             "decisions": decisions,
             "human_decisions": human_decisions,

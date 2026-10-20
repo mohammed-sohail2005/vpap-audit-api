@@ -135,3 +135,64 @@ tests/
 VPAP is intended to operate with controlled integrations and read-only scanner access. Scanner data may be incomplete or attacker-influenced, so schema validation, scoped access, TLS, rate limiting, and audit controls are important.
 
 VPAP is not intended to replace the vulnerability scanner, CMDB, or authoritative asset-owner process. It is also not intended to autonomously execute production patches, firewall changes, or other infrastructure modifications.
+
+## VPAP Audit API & Database Setup
+
+### 1. Environment Configuration
+
+Copy the example environment template and configure your PostgreSQL / Supabase connection:
+
+```bash
+cp .env.example .env
+```
+
+Ensure `VPAP_AUDIT_DSN` (or `DATABASE_URL`) and `VPAP_AUTH_SECRET` are configured in `.env`:
+
+```ini
+VPAP_AUDIT_DSN=postgresql://username:password@hostname:5432/dbname
+VPAP_AUTH_SECRET=your-secure-secret-here
+```
+
+### 2. Database Migrations
+
+Apply database migrations (idempotent, tracks applied migrations in `migration_history`):
+
+```bash
+python run_migrations.py
+```
+
+The migrations establish:
+- `0001_baseline_schema.sql`: Core 16 tables across Ingestion, Enrichment, Policy, Exceptions, and Audit.
+- `0002_add_batch_id_to_finding_instance.sql`: Batch relationship and index on `finding_instance`.
+- `0003_add_asset_contexts.sql`: Asset Context Source (ACS) table and audit event constraint updates.
+
+### 3. Service & Operator Token Generation
+
+Generate signed JWT access tokens out-of-band for core services and operators:
+
+```bash
+# Generate tokens for all 3 core services (Ingestion, Enrichment, Policy Engine) + UI Operator:
+python generate_token.py --services
+
+# Or generate a custom token:
+python generate_token.py --tenant vpap-pilot --scope "persistence:* audit:read" --subject custom-service
+```
+
+### 4. Running the Audit API
+
+Launch the FastAPI backend server:
+
+```bash
+uvicorn audit_api:app --reload --port 8000
+```
+
+Interactive OpenAPI docs will be available at: `http://localhost:8000/docs`
+
+### 5. Running Tests
+
+Run the test suite:
+
+```bash
+python -m pytest tests/test_asset_context.py -v
+```
+

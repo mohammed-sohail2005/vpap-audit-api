@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local executables and tunnels
+*.exe
+*.exe.old
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
